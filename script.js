@@ -1,4 +1,7 @@
 import * as THREE from 'three';
+import RAPIER from '@dimforge/rapier3d-compat';
+
+await RAPIER.init();
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x000000);
@@ -49,6 +52,67 @@ const HOVER_HEIGHT = 0.3;
 const BOB_AMP_XZ = 0.015;
 const BOB_AMP_Y = 0.025;
 const targetPos = new THREE.Vector3(0, HOVER_HEIGHT, 0);
+
+// Physics — kinematic orb pushes dynamic boxes via Rapier
+const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+
+// Ground plate: thin static cuboid with top face at y = 0
+const groundBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+world.createCollider(
+    RAPIER.ColliderDesc.cuboid(40, 0.05, 40).setTranslation(0, -0.05, 0),
+    groundBody,
+);
+
+// Orb collider is larger than the visible dot so it feels like the glow
+// is what shoves boxes around. Kinematic so the existing motion code owns it.
+const ORB_PHYS_RADIUS = 0.08;
+const orbBody = world.createRigidBody(
+    RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(
+        targetPos.x,
+        targetPos.y,
+        targetPos.z,
+    ),
+);
+world.createCollider(RAPIER.ColliderDesc.ball(ORB_PHYS_RADIUS), orbBody);
+
+// Dynamic boxes scattered nearby. Slight color variation so the orb's
+// blue/purple point light reads on each face.
+const BOX_SIZE = 0.3;
+const boxGeo = new THREE.BoxGeometry(BOX_SIZE, BOX_SIZE, BOX_SIZE);
+const boxMat = new THREE.MeshPhysicalMaterial({
+    color: 0x262630,
+    roughness: 0.35,
+    metalness: 0.05,
+    clearcoat: 0.7,
+    clearcoatRoughness: 0.15,
+});
+const boxes = [];
+const BOX_LAYOUT = [
+    [ 1.2, 0.8],
+    [-1.0, -1.3],
+    [ 0.6, -1.8],
+    [-1.6, 1.0],
+    [ 1.9, -0.4],
+    [-0.3, 1.7],
+    [ 2.4, 1.4],
+];
+for (const [x, z] of BOX_LAYOUT) {
+    const mesh = new THREE.Mesh(boxGeo, boxMat);
+    scene.add(mesh);
+    const body = world.createRigidBody(
+        RAPIER.RigidBodyDesc.dynamic()
+            .setTranslation(x, BOX_SIZE / 2, z)
+            .setLinearDamping(0.4)
+            .setAngularDamping(0.6),
+    );
+    world.createCollider(
+        RAPIER.ColliderDesc.cuboid(BOX_SIZE / 2, BOX_SIZE / 2, BOX_SIZE / 2)
+            .setRestitution(0.1)
+            .setFriction(0.8),
+        body,
+    );
+    boxes.push({ mesh, body });
+}
 
 // Continuous emissive trail tube that fades with age
 const TRAIL_LIFETIME = 1.4;
@@ -274,6 +338,21 @@ function animate() {
     );
 
     updateTrail(dt);
+
+    // Drive the orb's kinematic body from targetPos (un-bobbed, so contacts
+    // stay stable) — Rapier infers velocity from successive translations.
+    orbBody.setNextKinematicTranslation({
+        x: targetPos.x,
+        y: targetPos.y,
+        z: targetPos.z,
+    });
+    world.step();
+    for (const { mesh, body } of boxes) {
+        const t = body.translation();
+        const r = body.rotation();
+        mesh.position.set(t.x, t.y, t.z);
+        mesh.quaternion.set(r.x, r.y, r.z, r.w);
+    }
 
     idleTime += dt;
     const idleDelay = hasMoved ? IDLE_DELAY_REPEAT : IDLE_DELAY_FIRST;
