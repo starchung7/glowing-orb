@@ -41,7 +41,7 @@ orb.position.y = 0.3;
 scene.add(orb);
 
 // A point light at the orb to faintly illuminate the floor around it
-const orbLight = new THREE.PointLight(0xaaffaa, 1.5, 2.5, 2);
+const orbLight = new THREE.PointLight(0xccccff, 1.5, 2.5, 2);
 orb.add(orbLight);
 
 // Hover + bobbing — the orb floats above the floor and drifts with sine noise
@@ -56,7 +56,7 @@ const TRAIL_SPACING = 0.01;
 const TRAIL_RADIUS = 0.01;
 const TUBE_TUBULAR_SEGMENTS = 96;
 const TUBE_RADIAL_SEGMENTS = 6;
-const TRAIL_COLOR = new THREE.Color(0x9af07a);
+const TRAIL_COLOR = new THREE.Color(0xb0bcff);
 
 const trailPoints = []; // [{ pos: Vector3, age: number }]
 const lastTrailPos = orb.position.clone();
