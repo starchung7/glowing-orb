@@ -140,6 +140,25 @@ scene.add(new THREE.HemisphereLight(0xffffff, 0x101010, 0.15));
 // 3/4 view: above the orb, tilted forward
 const cameraOffset = new THREE.Vector3(0, 1.8, 1.8);
 
+// Idle hint — surfaces after 5s without input
+const idleHint = document.getElementById('idle-hint');
+const IDLE_DELAY = 5;
+let idleTime = 0;
+const showIdleHint = () => {
+    if (!idleHint) return;
+    idleHint.style.opacity = '';
+    idleHint.classList.add('visible');
+};
+const resetIdle = () => {
+    idleTime = 0;
+    if (!idleHint || !idleHint.classList.contains('visible')) return;
+    const current = getComputedStyle(idleHint).opacity;
+    idleHint.style.opacity = current;
+    idleHint.classList.remove('visible');
+    void idleHint.offsetWidth;
+    idleHint.style.opacity = '0';
+};
+
 // Input
 const keys = { w: false, a: false, s: false, d: false };
 const JUMP_SPEED = 4.25;
@@ -162,10 +181,12 @@ window.addEventListener('keydown', (e) => {
     const action = keyMap[e.code];
     if (action) {
         keys[action] = true;
+        resetIdle();
         e.preventDefault();
     }
     if (e.code === 'Space') {
         if (isGrounded()) velocityY = JUMP_SPEED;
+        resetIdle();
         e.preventDefault();
     }
 });
@@ -250,6 +271,11 @@ function animate() {
     );
 
     updateTrail(dt);
+
+    idleTime += dt;
+    if (idleHint && idleTime >= IDLE_DELAY && !idleHint.classList.contains('visible')) {
+        showIdleHint();
+    }
 
     // Camera follows the orb in all three axes so jumps lift the view too
     camera.position.copy(targetPos).add(cameraOffset);
