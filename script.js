@@ -37,16 +37,22 @@ const orb = new THREE.Mesh(
     new THREE.SphereGeometry(ORB_RADIUS, 24, 24),
     new THREE.MeshBasicMaterial({ color: 0xffffff })
 );
-orb.position.y = ORB_RADIUS;
+orb.position.y = 0.3;
 scene.add(orb);
 
 // A point light at the orb to faintly illuminate the floor around it
 const orbLight = new THREE.PointLight(0xaaffaa, 1.5, 2.5, 2);
 orb.add(orbLight);
 
+// Hover + bobbing — the orb floats above the floor and drifts with sine noise
+const HOVER_HEIGHT = 0.3;
+const BOB_AMP_XZ = 0.015;
+const BOB_AMP_Y = 0.025;
+const targetPos = new THREE.Vector3(0, HOVER_HEIGHT, 0);
+
 // Continuous emissive trail tube that fades with age
 const TRAIL_LIFETIME = 1.4;
-const TRAIL_SPACING = 0.04;
+const TRAIL_SPACING = 0.01;
 const TRAIL_RADIUS = 0.01;
 const TUBE_TUBULAR_SEGMENTS = 96;
 const TUBE_RADIAL_SEGMENTS = 6;
@@ -80,12 +86,20 @@ function updateTrail(dt) {
         trailPoints.shift();
     }
 
-    if (trailPoints.length < 2) {
+    // Always anchor the tip of the curve at the orb's current position so
+    // the trail stays visually attached even between spawns / when stopped.
+    const livePoints = trailPoints.slice();
+    const last = livePoints[livePoints.length - 1];
+    if (!last || orb.position.distanceToSquared(last.pos) > 1e-8) {
+        livePoints.push({ pos: orb.position.clone(), age: 0 });
+    }
+
+    if (livePoints.length < 2) {
         trailMesh.visible = false;
         return;
     }
 
-    const curve = new THREE.CatmullRomCurve3(trailPoints.map((p) => p.pos));
+    const curve = new THREE.CatmullRomCurve3(livePoints.map((p) => p.pos));
     const tubeGeo = new THREE.TubeGeometry(
         curve,
         TUBE_TUBULAR_SEGMENTS,
@@ -101,12 +115,12 @@ function updateTrail(dt) {
     for (let i = 0; i < positionCount; i++) {
         const ring = Math.floor(i / vertsPerRing);
         const t = ring / TUBE_TUBULAR_SEGMENTS; // 0 = oldest end, 1 = newest end
-        const fIdx = t * (trailPoints.length - 1);
+        const fIdx = t * (livePoints.length - 1);
         const i0 = Math.floor(fIdx);
-        const i1 = Math.min(i0 + 1, trailPoints.length - 1);
+        const i1 = Math.min(i0 + 1, livePoints.length - 1);
         const frac = fIdx - i0;
         const age =
-            trailPoints[i0].age * (1 - frac) + trailPoints[i1].age * frac;
+            livePoints[i0].age * (1 - frac) + livePoints[i1].age * frac;
         const k = Math.max(0, 1 - age / TRAIL_LIFETIME);
         colorArray[i * 3 + 0] = TRAIL_COLOR.r * k;
         colorArray[i * 3 + 1] = TRAIL_COLOR.g * k;
@@ -128,16 +142,26 @@ const cameraOffset = new THREE.Vector3(0, 1.8, 1.8);
 
 // Input
 const keys = { w: false, a: false, s: false, d: false };
-const JUMP_SPEED = 3;
-const GRAVITY = 18;
+const JUMP_SPEED = 4.25;
+const GRAVITY_UP = 12;           // strong gravity while ascending — quick up
+const GRAVITY_DOWN = 4;          // weak gravity while descending — floats down
+const SOFT_LAND_DISTANCE = 0.25; // ease zone above hover height
+const SOFT_LAND_DAMPING = 20;    // extra cushion right before landing
 let velocityY = 0;
 
-const isGrounded = () => orb.position.y <= ORB_RADIUS + 1e-4;
+const isGrounded = () => targetPos.y <= HOVER_HEIGHT + 1e-4;
+
+const keyMap = {
+    KeyW: 'w', ArrowUp: 'w',
+    KeyA: 'a', ArrowLeft: 'a',
+    KeyS: 's', ArrowDown: 's',
+    KeyD: 'd', ArrowRight: 'd',
+};
 
 window.addEventListener('keydown', (e) => {
-    const k = e.key.toLowerCase();
-    if (k in keys) {
-        keys[k] = true;
+    const action = keyMap[e.code];
+    if (action) {
+        keys[action] = true;
         e.preventDefault();
     }
     if (e.code === 'Space') {
@@ -146,8 +170,8 @@ window.addEventListener('keydown', (e) => {
     }
 });
 window.addEventListener('keyup', (e) => {
-    const k = e.key.toLowerCase();
-    if (k in keys) keys[k] = false;
+    const action = keyMap[e.code];
+    if (action) keys[action] = false;
 });
 
 window.addEventListener('resize', () => {
@@ -158,7 +182,10 @@ window.addEventListener('resize', () => {
 
 const clock = new THREE.Clock();
 const MOVE_SPEED = 2.5;
+const ACCEL_RATE = 5; // higher = snappier; lower = floatier
 const moveDir = new THREE.Vector3();
+const velocity = new THREE.Vector3();
+const targetVelocity = new THREE.Vector3();
 
 function animate() {
     const dt = Math.min(clock.getDelta(), 0.05);
@@ -168,23 +195,65 @@ function animate() {
         0,
         (keys.s ? 1 : 0) - (keys.w ? 1 : 0)
     );
-    if (moveDir.lengthSq() > 0) {
-        moveDir.normalize().multiplyScalar(MOVE_SPEED * dt);
-        orb.position.x += moveDir.x;
-        orb.position.z += moveDir.z;
+    if (moveDir.lengthSq() > 0) moveDir.normalize();
+    targetVelocity.set(moveDir.x * MOVE_SPEED, 0, moveDir.z * MOVE_SPEED);
+
+    // Exponential easing toward target velocity (frame-rate independent)
+    const smoothing = 1 - Math.exp(-ACCEL_RATE * dt);
+    velocity.x += (targetVelocity.x - velocity.x) * smoothing;
+    velocity.z += (targetVelocity.z - velocity.z) * smoothing;
+
+    targetPos.x += velocity.x * dt;
+    targetPos.z += velocity.z * dt;
+
+    velocityY -= (velocityY > 0 ? GRAVITY_UP : GRAVITY_DOWN) * dt;
+
+    // Soft landing — exponentially damp downward velocity as we approach
+    // the hover plane, so the fall eases out at the very end.
+    if (velocityY < 0) {
+        const heightAbove = targetPos.y - HOVER_HEIGHT;
+        if (heightAbove > 0 && heightAbove < SOFT_LAND_DISTANCE) {
+            const proximity = 1 - heightAbove / SOFT_LAND_DISTANCE;
+            velocityY *= Math.exp(-SOFT_LAND_DAMPING * proximity * dt);
+        }
     }
 
-    velocityY -= GRAVITY * dt;
-    orb.position.y += velocityY * dt;
-    if (orb.position.y < ORB_RADIUS) {
-        orb.position.y = ORB_RADIUS;
+    targetPos.y += velocityY * dt;
+    if (targetPos.y < HOVER_HEIGHT) {
+        targetPos.y = HOVER_HEIGHT;
         velocityY = 0;
     }
 
+    // Bobbing is more intense when idle; scales down when moving at speed
+    const speed = Math.hypot(velocity.x, velocity.z);
+    const idleFactor = 1 - Math.min(1, speed / MOVE_SPEED);
+    const bobScale = 1 + idleFactor * 3.5;
+
+    // Quasi-random bobbing via summed sines on each axis
+    const t = clock.elapsedTime;
+    const bobX =
+        (Math.sin(t * 1.1 + 0.7) * 0.6 + Math.sin(t * 1.9 + 2.1) * 0.4) *
+        BOB_AMP_XZ *
+        bobScale;
+    const bobY =
+        (Math.sin(t * 1.7) * 0.6 + Math.sin(t * 2.3 + 1.2) * 0.4) *
+        BOB_AMP_Y *
+        bobScale;
+    const bobZ =
+        (Math.sin(t * 1.3 + 1.5) * 0.6 + Math.sin(t * 2.1 + 0.3) * 0.4) *
+        BOB_AMP_XZ *
+        bobScale;
+    orb.position.set(
+        targetPos.x + bobX,
+        targetPos.y + bobY,
+        targetPos.z + bobZ
+    );
+
     updateTrail(dt);
 
-    camera.position.copy(orb.position).add(cameraOffset);
-    camera.lookAt(orb.position);
+    // Camera follows the orb in all three axes so jumps lift the view too
+    camera.position.copy(targetPos).add(cameraOffset);
+    camera.lookAt(targetPos);
 
     renderer.render(scene, camera);
     requestAnimationFrame(animate);
