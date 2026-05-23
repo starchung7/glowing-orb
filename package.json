@@ -1,0 +1,17 @@
+{
+  "name": "glowing-orb",
+  "version": "1.0.0",
+  "description": "Glowing white orb on a glossy black floor",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "type": "module",
+  "dependencies": {
+    "three": "^0.160.0"
+  },
+  "devDependencies": {
+    "vite": "^7.2.4"
+  }
+}
