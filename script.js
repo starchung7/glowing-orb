@@ -140,10 +140,12 @@ scene.add(new THREE.HemisphereLight(0xffffff, 0x101010, 0.15));
 // 3/4 view: above the orb, tilted forward
 const cameraOffset = new THREE.Vector3(0, 1.8, 1.8);
 
-// Idle hint — surfaces after 5s without input
+// Idle hint — 5s the first time, 30s after the user has already moved
 const idleHint = document.getElementById('idle-hint');
-const IDLE_DELAY = 5;
+const IDLE_DELAY_FIRST = 5;
+const IDLE_DELAY_REPEAT = 30;
 let idleTime = 0;
+let hasMoved = false;
 const showIdleHint = () => {
     if (!idleHint) return;
     idleHint.style.opacity = '';
@@ -151,6 +153,7 @@ const showIdleHint = () => {
 };
 const resetIdle = () => {
     idleTime = 0;
+    hasMoved = true;
     if (!idleHint || !idleHint.classList.contains('visible')) return;
     const current = getComputedStyle(idleHint).opacity;
     idleHint.style.opacity = current;
@@ -273,7 +276,8 @@ function animate() {
     updateTrail(dt);
 
     idleTime += dt;
-    if (idleHint && idleTime >= IDLE_DELAY && !idleHint.classList.contains('visible')) {
+    const idleDelay = hasMoved ? IDLE_DELAY_REPEAT : IDLE_DELAY_FIRST;
+    if (idleHint && idleTime >= idleDelay && !idleHint.classList.contains('visible')) {
         showIdleHint();
     }
 
