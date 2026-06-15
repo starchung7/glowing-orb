@@ -19,7 +19,7 @@ const params = {
     trailLifetime: 1.4,
     trailSpacing: 0.01,
     trailColor: '#b0bcff',
-    bobXZ: 0.03,
+    bobXZ: 0.015,
     bobY: 0.025,
     bobIdleBoost: 5, // extra bob amplitude multiplier when idle vs moving
     bobResponse: 6,    // how fast bob amplitude eases in/out (lower = gentler)
