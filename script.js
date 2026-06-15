@@ -475,6 +475,8 @@ particleFolder.add(particleMaterial.uniforms.uSizeScale, 'value', 1, 20, 0.5).na
 particleFolder.addColor(params, 'particleLightColor').name('light color')
     .onChange((v) => particleMaterial.uniforms.uLightColor.value.set(v));
 
+gui.close(); // start collapsed
+
 function animate() {
     const dt = Math.min(clock.getDelta(), 0.05);
 
