@@ -228,12 +228,17 @@ const resetIdle = () => {
 
 // Input
 const keys = { w: false, a: false, s: false, d: false };
-const JUMP_SPEED = 4.25;
-const GRAVITY_UP = 12;           // strong gravity while ascending — quick up
+// Jump is a brief upward "propulsion" rather than an instant impulse: holding
+// a thrust acceleration for a short window ramps velocity up from zero, so the
+// launch feels like fast acceleration instead of an abrupt bounce.
+const JUMP_THRUST_ACCEL = 30;    // upward acceleration during the thrust window
+const JUMP_THRUST_TIME = 0.18;   // how long the propulsion lasts (seconds)
+const GRAVITY_UP = 9;            // gravity while ascending — lower = floatier rise
 const GRAVITY_DOWN = 4;          // weak gravity while descending — floats down
 const SOFT_LAND_DISTANCE = 0.25; // ease zone above hover height
 const SOFT_LAND_DAMPING = 20;    // extra cushion right before landing
 let velocityY = 0;
+let jumpThrustTime = 0;          // remaining propulsion time
 
 const isGrounded = () => targetPos.y <= HOVER_HEIGHT + 1e-4;
 
@@ -252,7 +257,7 @@ window.addEventListener('keydown', (e) => {
         e.preventDefault();
     }
     if (e.code === 'Space') {
-        if (isGrounded()) velocityY = JUMP_SPEED;
+        if (isGrounded()) jumpThrustTime = JUMP_THRUST_TIME;
         resetIdle();
         e.preventDefault();
     }
@@ -293,6 +298,14 @@ function animate() {
 
     targetPos.x += velocity.x * dt;
     targetPos.z += velocity.z * dt;
+
+    // Propulsion phase: apply upward thrust so the launch accelerates from
+    // zero instead of starting at full speed.
+    if (jumpThrustTime > 0) {
+        const thrustStep = Math.min(jumpThrustTime, dt);
+        velocityY += JUMP_THRUST_ACCEL * thrustStep;
+        jumpThrustTime -= dt;
+    }
 
     velocityY -= (velocityY > 0 ? GRAVITY_UP : GRAVITY_DOWN) * dt;
 
