@@ -60,45 +60,30 @@
             align-items: center;
             justify-content: center;
         }
-        #idle-hint .key::before {
-            content: "";
-            width: 0;
-            height: 0;
+        #idle-hint .key svg {
+            width: 10px;
+            height: 10px;
+            display: block;
+            fill: none;
+            stroke: currentColor;
+            stroke-width: 1.4;
+            stroke-linejoin: round;
+            stroke-linecap: round;
         }
         #idle-hint .key-up    { grid-column: 2; grid-row: 1; }
         #idle-hint .key-left  { grid-column: 1; grid-row: 2; }
         #idle-hint .key-down  { grid-column: 2; grid-row: 2; }
         #idle-hint .key-right { grid-column: 3; grid-row: 2; }
-        #idle-hint .key-up::before {
-            border-left: 4px solid transparent;
-            border-right: 4px solid transparent;
-            border-bottom: 6px solid currentColor;
-        }
-        #idle-hint .key-down::before {
-            border-left: 4px solid transparent;
-            border-right: 4px solid transparent;
-            border-top: 6px solid currentColor;
-        }
-        #idle-hint .key-left::before {
-            border-top: 4px solid transparent;
-            border-bottom: 4px solid transparent;
-            border-right: 6px solid currentColor;
-        }
-        #idle-hint .key-right::before {
-            border-top: 4px solid transparent;
-            border-bottom: 4px solid transparent;
-            border-left: 6px solid currentColor;
-        }
     </style>
 </head>
 <body>
     <div id="name-label">CADEN CHUNG</div>
     <div id="idle-hint">
         <div class="arrow-keys">
-            <div class="key key-up"></div>
-            <div class="key key-left"></div>
-            <div class="key key-down"></div>
-            <div class="key key-right"></div>
+            <div class="key key-up"><svg viewBox="0 0 12 12"><polygon points="6,2.5 10,9 2,9"/></svg></div>
+            <div class="key key-left"><svg viewBox="0 0 12 12"><polygon points="2.5,6 9,2 9,10"/></svg></div>
+            <div class="key key-down"><svg viewBox="0 0 12 12"><polygon points="6,9.5 2,3 10,3"/></svg></div>
+            <div class="key key-right"><svg viewBox="0 0 12 12"><polygon points="9.5,6 3,2 3,10"/></svg></div>
         </div>
         <div class="hint-text">Use the arrow keys to move around</div>
     </div>
