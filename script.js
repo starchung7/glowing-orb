@@ -35,7 +35,7 @@ floor.rotation.x = -Math.PI / 2;
 scene.add(floor);
 
 // Tiny glowing orb — same radius as the trail tube so they sit flush
-const ORB_RADIUS = 0.01;
+const ORB_RADIUS = 0.008;
 const orb = new THREE.Mesh(
     new THREE.SphereGeometry(ORB_RADIUS, 24, 24),
     new THREE.MeshBasicMaterial({ color: 0xffffff })
@@ -117,7 +117,7 @@ for (const [x, z] of BOX_LAYOUT) {
 // Continuous emissive trail tube that fades with age
 const TRAIL_LIFETIME = 1.4;
 const TRAIL_SPACING = 0.01;
-const TRAIL_RADIUS = 0.01;
+const TRAIL_RADIUS = 0.008;
 const TUBE_TUBULAR_SEGMENTS = 96;
 const TUBE_RADIAL_SEGMENTS = 6;
 const TRAIL_COLOR = new THREE.Color(0xb0bcff);
@@ -270,7 +270,7 @@ window.addEventListener('resize', () => {
 
 const clock = new THREE.Clock();
 const MOVE_SPEED = 2.5;
-const ACCEL_RATE = 5; // higher = snappier; lower = floatier
+const ACCEL_RATE = 4; // higher = snappier; lower = floatier
 const moveDir = new THREE.Vector3();
 const velocity = new THREE.Vector3();
 const targetVelocity = new THREE.Vector3();
