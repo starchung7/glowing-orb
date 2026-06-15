@@ -132,31 +132,67 @@ for (const [x, z] of BOX_LAYOUT) {
     boxes.push({ mesh, body });
 }
 
-// Continuous emissive trail tube that fades with age
-const TUBE_TUBULAR_SEGMENTS = 96;
-const TUBE_RADIAL_SEGMENTS = 6;
+// Continuous emissive trail — a camera-facing 2D ribbon ("card") instead of a
+// 3D tube. Each trail point emits just two vertices, offset perpendicular to
+// both the path direction and the view direction, so the strip always faces the
+// camera. This is far lighter than a TubeGeometry (2 verts/point vs a full ring,
+// and no Frenet-frame math or curve resampling), and the buffers are allocated
+// once and updated in place to avoid per-frame geometry allocation/GC.
 const TRAIL_COLOR = new THREE.Color(params.trailColor);
 
 const trailPoints = []; // [{ pos: Vector3, age: number }]
 const lastTrailPos = orb.position.clone();
 
+let trailCapacity = 256; // max trail points the buffers can hold; grows on demand
+const trailGeometry = new THREE.BufferGeometry();
+let trailPositions = new Float32Array(trailCapacity * 2 * 3);
+let trailColors = new Float32Array(trailCapacity * 2 * 3);
+trailGeometry.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+trailGeometry.setAttribute('color', new THREE.BufferAttribute(trailColors, 3));
+
+// The vertex layout is regular (2 verts per point), so the index buffer only
+// depends on capacity, not on the live point count — build it once per capacity.
+function buildTrailIndices(capacity) {
+    const idx = new Uint32Array(Math.max(0, capacity - 1) * 6);
+    for (let i = 0; i < capacity - 1; i++) {
+        const a = i * 2, b = i * 2 + 1, c = (i + 1) * 2, d = (i + 1) * 2 + 1;
+        const o = i * 6;
+        idx[o] = a; idx[o + 1] = b; idx[o + 2] = c;
+        idx[o + 3] = b; idx[o + 4] = d; idx[o + 5] = c;
+    }
+    return idx;
+}
+trailGeometry.setIndex(new THREE.BufferAttribute(buildTrailIndices(trailCapacity), 1));
+
+// Opaque (no additive blending) so self-crossings don't brighten where the
+// ribbon overlaps — depth testing resolves overlaps to the nearest segment.
+// The age fade still reads because it darkens toward the near-black scene.
 const trailMaterial = new THREE.MeshBasicMaterial({
     vertexColors: true,
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide,
 });
-const trailMesh = new THREE.Mesh(new THREE.BufferGeometry(), trailMaterial);
+const trailMesh = new THREE.Mesh(trailGeometry, trailMaterial);
 trailMesh.frustumCulled = false;
 trailMesh.visible = false;
 scene.add(trailMesh);
 
+// Reused scratch vectors so the per-frame update allocates nothing.
+const _tan = new THREE.Vector3();
+const _camDir = new THREE.Vector3();
+const _side = new THREE.Vector3();
+
+function growTrailCapacity(needed) {
+    while (trailCapacity < needed) trailCapacity *= 2;
+    trailPositions = new Float32Array(trailCapacity * 2 * 3);
+    trailColors = new Float32Array(trailCapacity * 2 * 3);
+    trailGeometry.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+    trailGeometry.setAttribute('color', new THREE.BufferAttribute(trailColors, 3));
+    trailGeometry.setIndex(new THREE.BufferAttribute(buildTrailIndices(trailCapacity), 1));
+}
+
 function updateTrail(dt) {
     if (orb.position.distanceTo(lastTrailPos) > params.trailSpacing) {
-        trailPoints.push({
-            pos: orb.position.clone(),
-            age: 0,
-        });
+        trailPoints.push({ pos: orb.position.clone(), age: 0 });
         lastTrailPos.copy(orb.position);
     }
 
@@ -165,50 +201,60 @@ function updateTrail(dt) {
         trailPoints.shift();
     }
 
-    // Always anchor the tip of the curve at the orb's current position so
-    // the trail stays visually attached even between spawns / when stopped.
-    const livePoints = trailPoints.slice();
-    const last = livePoints[livePoints.length - 1];
-    if (!last || orb.position.distanceToSquared(last.pos) > 1e-8) {
-        livePoints.push({ pos: orb.position.clone(), age: 0 });
-    }
+    // Anchor the tip at the orb's current position so the ribbon stays attached
+    // even between spawns / when stopped. The tip is treated as a virtual extra
+    // point rather than allocating a new array each frame.
+    const n = trailPoints.length;
+    const needTip =
+        n === 0 || orb.position.distanceToSquared(trailPoints[n - 1].pos) > 1e-8;
+    const count = n + (needTip ? 1 : 0);
 
-    if (livePoints.length < 2) {
+    if (count < 2) {
         trailMesh.visible = false;
         return;
     }
+    if (count > trailCapacity) growTrailCapacity(count);
 
-    const curve = new THREE.CatmullRomCurve3(livePoints.map((p) => p.pos));
-    const tubeGeo = new THREE.TubeGeometry(
-        curve,
-        TUBE_TUBULAR_SEGMENTS,
-        params.trailRadius,
-        TUBE_RADIAL_SEGMENTS,
-        false
-    );
+    const halfWidth = params.trailRadius;
+    const lifetime = params.trailLifetime;
+    const posAt = (j) => (j < n ? trailPoints[j].pos : orb.position);
+    const ageAt = (j) => (j < n ? trailPoints[j].age : 0);
 
-    // Per-vertex color, fading from oldest (start) to newest (end)
-    const positionCount = tubeGeo.attributes.position.count;
-    const colorArray = new Float32Array(positionCount * 3);
-    const vertsPerRing = TUBE_RADIAL_SEGMENTS + 1;
-    for (let i = 0; i < positionCount; i++) {
-        const ring = Math.floor(i / vertsPerRing);
-        const t = ring / TUBE_TUBULAR_SEGMENTS; // 0 = oldest end, 1 = newest end
-        const fIdx = t * (livePoints.length - 1);
-        const i0 = Math.floor(fIdx);
-        const i1 = Math.min(i0 + 1, livePoints.length - 1);
-        const frac = fIdx - i0;
-        const age =
-            livePoints[i0].age * (1 - frac) + livePoints[i1].age * frac;
-        const k = Math.max(0, 1 - age / params.trailLifetime);
-        colorArray[i * 3 + 0] = TRAIL_COLOR.r * k;
-        colorArray[i * 3 + 1] = TRAIL_COLOR.g * k;
-        colorArray[i * 3 + 2] = TRAIL_COLOR.b * k;
+    for (let j = 0; j < count; j++) {
+        const cur = posAt(j);
+        // Path tangent from neighbouring points.
+        _tan.subVectors(posAt(Math.min(count - 1, j + 1)), posAt(Math.max(0, j - 1)));
+        if (_tan.lengthSq() < 1e-12) _tan.set(1, 0, 0);
+        _tan.normalize();
+
+        // Offset perpendicular to both the path and the view direction so the
+        // ribbon presents its flat face to the camera.
+        _camDir.subVectors(camera.position, cur);
+        _side.crossVectors(_tan, _camDir);
+        if (_side.lengthSq() < 1e-12) {
+            _side.set(-_tan.z, 0, _tan.x); // fallback when path points at camera
+            if (_side.lengthSq() < 1e-12) _side.set(1, 0, 0);
+        }
+        _side.normalize().multiplyScalar(halfWidth);
+
+        const k = Math.max(0, 1 - ageAt(j) / lifetime);
+        const r = TRAIL_COLOR.r * k, g = TRAIL_COLOR.g * k, b = TRAIL_COLOR.b * k;
+
+        const vi = j * 6;
+        trailPositions[vi]     = cur.x + _side.x;
+        trailPositions[vi + 1] = cur.y + _side.y;
+        trailPositions[vi + 2] = cur.z + _side.z;
+        trailPositions[vi + 3] = cur.x - _side.x;
+        trailPositions[vi + 4] = cur.y - _side.y;
+        trailPositions[vi + 5] = cur.z - _side.z;
+
+        trailColors[vi] = r; trailColors[vi + 1] = g; trailColors[vi + 2] = b;
+        trailColors[vi + 3] = r; trailColors[vi + 4] = g; trailColors[vi + 5] = b;
     }
-    tubeGeo.setAttribute('color', new THREE.BufferAttribute(colorArray, 3));
 
-    trailMesh.geometry.dispose();
-    trailMesh.geometry = tubeGeo;
+    trailGeometry.setDrawRange(0, (count - 1) * 6);
+    trailGeometry.attributes.position.needsUpdate = true;
+    trailGeometry.attributes.color.needsUpdate = true;
     trailMesh.visible = true;
 }
 
