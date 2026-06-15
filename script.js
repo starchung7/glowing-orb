@@ -19,8 +19,10 @@ const params = {
     trailLifetime: 1.4,
     trailSpacing: 0.01,
     trailColor: '#b0bcff',
-    bobXZ: 0.015,
+    bobXZ: 0.03,
     bobY: 0.025,
+    bobIdleBoost: 5, // extra bob amplitude multiplier when idle vs moving
+    bobResponse: 6,    // how fast bob amplitude eases in/out (lower = gentler)
     particleLightColor: '#ccccff',
 };
 
@@ -390,6 +392,7 @@ const SOFT_LAND_DISTANCE = 0.25; // ease zone above hover height
 const SOFT_LAND_DAMPING = 20;    // extra cushion right before landing
 let velocityY = 0;
 let jumpThrustTime = 0;          // remaining propulsion time
+let bobScaleSmooth = 1;          // eased bob amplitude factor (avoids snapping)
 
 const isGrounded = () => targetPos.y <= HOVER_HEIGHT + 1e-4;
 
@@ -463,6 +466,8 @@ trailFolder.addColor(params, 'trailColor').name('color')
 const bobFolder = gui.addFolder('Bobbing');
 bobFolder.add(params, 'bobXZ', 0, 0.1, 0.005).name('amp X/Z');
 bobFolder.add(params, 'bobY', 0, 0.1, 0.005).name('amp Y');
+bobFolder.add(params, 'bobIdleBoost', 0, 6, 0.1).name('idle boost');
+bobFolder.add(params, 'bobResponse', 0.2, 6, 0.1).name('response');
 
 const particleFolder = gui.addFolder('Particles');
 particleFolder.add(particleMaterial.uniforms.uLightRange, 'value', 0.5, 10, 0.1).name('light range');
@@ -518,7 +523,13 @@ function animate() {
     // Bobbing is more intense when idle; scales down when moving at speed
     const speed = Math.hypot(velocity.x, velocity.z);
     const idleFactor = 1 - Math.min(1, speed / params.moveSpeed);
-    const bobScale = 1 + idleFactor * 3.5;
+    const targetBobScale = 1 + idleFactor * params.bobIdleBoost;
+    // Ease the bob amplitude toward its target so it fades in/out gently instead
+    // of snapping when you stop — otherwise the orb lurches to the enlarged bob
+    // offset the instant velocity decays.
+    bobScaleSmooth += (targetBobScale - bobScaleSmooth) *
+        (1 - Math.exp(-params.bobResponse * dt));
+    const bobScale = bobScaleSmooth;
 
     // Quasi-random bobbing via summed sines on each axis
     const t = clock.elapsedTime;
