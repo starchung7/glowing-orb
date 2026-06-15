@@ -201,6 +201,100 @@ function updateTrail(dt) {
 scene.add(new THREE.AmbientLight(0xffffff, 0.08));
 scene.add(new THREE.HemisphereLight(0xffffff, 0x101010, 0.15));
 
+// Floating dust particles — a single GPU point cloud (one draw call) whose
+// brightness reacts to the orb's light. Lighting and drift are computed in the
+// shader from the orb position, so the only per-frame CPU cost is two uniforms.
+const PARTICLE_COUNT = 600;
+const PARTICLE_AREA = 6;        // half-extent of the spawn volume in X/Z
+const PARTICLE_Y_MIN = 0.15;
+const PARTICLE_Y_MAX = 4.0;
+const PARTICLE_LIGHT_RANGE = 3.5; // how far the orb's glow reaches a particle
+
+const particleGeo = new THREE.BufferGeometry();
+const pPositions = new Float32Array(PARTICLE_COUNT * 3);
+const pSizes = new Float32Array(PARTICLE_COUNT);
+const pDrift = new Float32Array(PARTICLE_COUNT * 3);
+const pPhase = new Float32Array(PARTICLE_COUNT);
+for (let i = 0; i < PARTICLE_COUNT; i++) {
+    pPositions[i * 3 + 0] = (Math.random() * 2 - 1) * PARTICLE_AREA;
+    pPositions[i * 3 + 1] = PARTICLE_Y_MIN + Math.random() * (PARTICLE_Y_MAX - PARTICLE_Y_MIN);
+    pPositions[i * 3 + 2] = (Math.random() * 2 - 1) * PARTICLE_AREA;
+    pSizes[i] = 0.8 + Math.random() * 1.8;
+    pDrift[i * 3 + 0] = 0.1 + Math.random() * 0.3;
+    pDrift[i * 3 + 1] = 0.08 + Math.random() * 0.22;
+    pDrift[i * 3 + 2] = 0.1 + Math.random() * 0.3;
+    pPhase[i] = Math.random() * Math.PI * 2;
+}
+particleGeo.setAttribute('position', new THREE.BufferAttribute(pPositions, 3));
+particleGeo.setAttribute('aSize', new THREE.BufferAttribute(pSizes, 1));
+particleGeo.setAttribute('aDrift', new THREE.BufferAttribute(pDrift, 3));
+particleGeo.setAttribute('aPhase', new THREE.BufferAttribute(pPhase, 1));
+
+const particleMaterial = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    uniforms: {
+        uTime: { value: 0 },
+        uOrbPos: { value: new THREE.Vector3() },
+        uLightColor: { value: new THREE.Color(0xccccff) },
+        uAmbient: { value: new THREE.Color(0x0a0c14) },
+        uLightRange: { value: PARTICLE_LIGHT_RANGE },
+        uSizeScale: { value: 7.0 },
+        uPixelRatio: { value: renderer.getPixelRatio() },
+    },
+    vertexShader: /* glsl */ `
+        uniform float uTime;
+        uniform vec3 uOrbPos;
+        uniform float uLightRange;
+        uniform float uSizeScale;
+        uniform float uPixelRatio;
+        attribute float aSize;
+        attribute vec3 aDrift;
+        attribute float aPhase;
+        varying float vAtten;
+        varying float vTwinkle;
+
+        void main() {
+            vec3 p = position;
+            // Bounded floating drift, fully GPU-side (no CPU updates).
+            p.x += sin(uTime * 0.30 + aPhase) * aDrift.x;
+            p.y += sin(uTime * 0.40 + aPhase * 1.7) * aDrift.y;
+            p.z += cos(uTime * 0.35 + aPhase * 1.3) * aDrift.z;
+
+            // Quadratic falloff from the orb — this is the "light reaction".
+            float d = distance(p, uOrbPos);
+            float a = clamp(1.0 - d / uLightRange, 0.0, 1.0);
+            vAtten = a * a;
+            vTwinkle = 0.75 + 0.25 * sin(uTime * 1.5 + aPhase * 3.0);
+
+            vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
+            gl_PointSize = aSize * uSizeScale * uPixelRatio / -mvPosition.z;
+            gl_Position = projectionMatrix * mvPosition;
+        }
+    `,
+    fragmentShader: /* glsl */ `
+        uniform vec3 uLightColor;
+        uniform vec3 uAmbient;
+        varying float vAtten;
+        varying float vTwinkle;
+
+        void main() {
+            vec2 uv = gl_PointCoord - 0.5;
+            float r = length(uv);
+            if (r > 0.5) discard;
+            float soft = smoothstep(0.5, 0.0, r);
+            vec3 col = uAmbient + uLightColor * vAtten;
+            float alpha = soft * (0.12 + vAtten) * vTwinkle;
+            gl_FragColor = vec4(col, alpha);
+        }
+    `,
+});
+
+const particles = new THREE.Points(particleGeo, particleMaterial);
+particles.frustumCulled = false;
+scene.add(particles);
+
 // 3/4 view: above the orb, tilted forward
 const cameraOffset = new THREE.Vector3(0, 1.8, 1.8);
 
@@ -271,6 +365,7 @@ window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    particleMaterial.uniforms.uPixelRatio.value = renderer.getPixelRatio();
 });
 
 const clock = new THREE.Clock();
@@ -351,6 +446,10 @@ function animate() {
     );
 
     updateTrail(dt);
+
+    // Drive the particle field's light reaction from the live orb position.
+    particleMaterial.uniforms.uTime.value = clock.elapsedTime;
+    particleMaterial.uniforms.uOrbPos.value.copy(orb.position);
 
     // Drive the orb's kinematic body from targetPos (un-bobbed, so contacts
     // stay stable) — Rapier infers velocity from successive translations.
