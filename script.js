@@ -164,12 +164,12 @@ function buildTrailIndices(capacity) {
 }
 trailGeometry.setIndex(new THREE.BufferAttribute(buildTrailIndices(trailCapacity), 1));
 
-// Opaque (no additive blending) so self-crossings don't brighten where the
-// ribbon overlaps — depth testing resolves overlaps to the nearest segment.
-// The age fade still reads because it darkens toward the near-black scene.
 const trailMaterial = new THREE.MeshBasicMaterial({
     vertexColors: true,
+    transparent: true,
+    depthWrite: false,
     side: THREE.DoubleSide,
+    blending: THREE.AdditiveBlending,
 });
 const trailMesh = new THREE.Mesh(trailGeometry, trailMaterial);
 trailMesh.frustumCulled = false;
