@@ -1,7 +1,28 @@
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
+import GUI from 'lil-gui';
 
 await RAPIER.init();
+
+// Live-tunable parameters, exposed through the lil-gui panel below.
+const params = {
+    orbRadius: 0.008,
+    orbLightIntensity: 1.5,
+    orbLightColor: '#ccccff',
+    moveSpeed: 2.5,
+    accelRate: 4,
+    jumpThrustAccel: 30,
+    jumpThrustTime: 0.18,
+    gravityUp: 9,
+    gravityDown: 4,
+    trailRadius: 0.008,
+    trailLifetime: 1.4,
+    trailSpacing: 0.01,
+    trailColor: '#b0bcff',
+    bobXZ: 0.015,
+    bobY: 0.025,
+    particleLightColor: '#ccccff',
+};
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x000000);
@@ -35,22 +56,19 @@ floor.rotation.x = -Math.PI / 2;
 scene.add(floor);
 
 // Tiny glowing orb — same radius as the trail tube so they sit flush
-const ORB_RADIUS = 0.008;
 const orb = new THREE.Mesh(
-    new THREE.SphereGeometry(ORB_RADIUS, 24, 24),
+    new THREE.SphereGeometry(params.orbRadius, 24, 24),
     new THREE.MeshBasicMaterial({ color: 0xffffff })
 );
 orb.position.y = 0.3;
 scene.add(orb);
 
 // A point light at the orb to faintly illuminate the floor around it
-const orbLight = new THREE.PointLight(0xccccff, 1.5, 2.5, 2);
+const orbLight = new THREE.PointLight(params.orbLightColor, params.orbLightIntensity, 2.5, 2);
 orb.add(orbLight);
 
 // Hover + bobbing — the orb floats above the floor and drifts with sine noise
 const HOVER_HEIGHT = 0.3;
-const BOB_AMP_XZ = 0.015;
-const BOB_AMP_Y = 0.025;
 const targetPos = new THREE.Vector3(0, HOVER_HEIGHT, 0);
 
 // Physics — kinematic orb pushes dynamic boxes via Rapier
@@ -115,12 +133,9 @@ for (const [x, z] of BOX_LAYOUT) {
 }
 
 // Continuous emissive trail tube that fades with age
-const TRAIL_LIFETIME = 1.4;
-const TRAIL_SPACING = 0.01;
-const TRAIL_RADIUS = 0.008;
 const TUBE_TUBULAR_SEGMENTS = 96;
 const TUBE_RADIAL_SEGMENTS = 6;
-const TRAIL_COLOR = new THREE.Color(0xb0bcff);
+const TRAIL_COLOR = new THREE.Color(params.trailColor);
 
 const trailPoints = []; // [{ pos: Vector3, age: number }]
 const lastTrailPos = orb.position.clone();
@@ -137,7 +152,7 @@ trailMesh.visible = false;
 scene.add(trailMesh);
 
 function updateTrail(dt) {
-    if (orb.position.distanceTo(lastTrailPos) > TRAIL_SPACING) {
+    if (orb.position.distanceTo(lastTrailPos) > params.trailSpacing) {
         trailPoints.push({
             pos: orb.position.clone(),
             age: 0,
@@ -146,7 +161,7 @@ function updateTrail(dt) {
     }
 
     for (const p of trailPoints) p.age += dt;
-    while (trailPoints.length > 0 && trailPoints[0].age >= TRAIL_LIFETIME) {
+    while (trailPoints.length > 0 && trailPoints[0].age >= params.trailLifetime) {
         trailPoints.shift();
     }
 
@@ -167,7 +182,7 @@ function updateTrail(dt) {
     const tubeGeo = new THREE.TubeGeometry(
         curve,
         TUBE_TUBULAR_SEGMENTS,
-        TRAIL_RADIUS,
+        params.trailRadius,
         TUBE_RADIAL_SEGMENTS,
         false
     );
@@ -185,7 +200,7 @@ function updateTrail(dt) {
         const frac = fIdx - i0;
         const age =
             livePoints[i0].age * (1 - frac) + livePoints[i1].age * frac;
-        const k = Math.max(0, 1 - age / TRAIL_LIFETIME);
+        const k = Math.max(0, 1 - age / params.trailLifetime);
         colorArray[i * 3 + 0] = TRAIL_COLOR.r * k;
         colorArray[i * 3 + 1] = TRAIL_COLOR.g * k;
         colorArray[i * 3 + 2] = TRAIL_COLOR.b * k;
@@ -325,10 +340,6 @@ const keys = { w: false, a: false, s: false, d: false };
 // Jump is a brief upward "propulsion" rather than an instant impulse: holding
 // a thrust acceleration for a short window ramps velocity up from zero, so the
 // launch feels like fast acceleration instead of an abrupt bounce.
-const JUMP_THRUST_ACCEL = 30;    // upward acceleration during the thrust window
-const JUMP_THRUST_TIME = 0.18;   // how long the propulsion lasts (seconds)
-const GRAVITY_UP = 9;            // gravity while ascending — lower = floatier rise
-const GRAVITY_DOWN = 4;          // weak gravity while descending — floats down
 const SOFT_LAND_DISTANCE = 0.25; // ease zone above hover height
 const SOFT_LAND_DAMPING = 20;    // extra cushion right before landing
 let velocityY = 0;
@@ -351,7 +362,7 @@ window.addEventListener('keydown', (e) => {
         e.preventDefault();
     }
     if (e.code === 'Space') {
-        if (isGrounded()) jumpThrustTime = JUMP_THRUST_TIME;
+        if (isGrounded()) jumpThrustTime = params.jumpThrustTime;
         resetIdle();
         e.preventDefault();
     }
@@ -369,11 +380,49 @@ window.addEventListener('resize', () => {
 });
 
 const clock = new THREE.Clock();
-const MOVE_SPEED = 2.5;
-const ACCEL_RATE = 4; // higher = snappier; lower = floatier
 const moveDir = new THREE.Vector3();
 const velocity = new THREE.Vector3();
 const targetVelocity = new THREE.Vector3();
+
+// --- Live controls (lil-gui) ---
+const gui = new GUI({ title: 'Controls' });
+
+const orbFolder = gui.addFolder('Orb');
+orbFolder.add(params, 'orbRadius', 0.002, 0.05, 0.001).name('radius').onChange((v) => {
+    orb.geometry.dispose();
+    orb.geometry = new THREE.SphereGeometry(v, 24, 24);
+});
+orbFolder.add(orbLight, 'intensity', 0, 5, 0.1).name('light intensity');
+orbFolder.add(orbLight, 'distance', 0.5, 8, 0.1).name('light distance');
+orbFolder.addColor(params, 'orbLightColor').name('light color')
+    .onChange((v) => orbLight.color.set(v));
+
+const moveFolder = gui.addFolder('Movement');
+moveFolder.add(params, 'moveSpeed', 0.5, 6, 0.1).name('speed');
+moveFolder.add(params, 'accelRate', 1, 12, 0.5).name('turn smoothing');
+
+const jumpFolder = gui.addFolder('Jump');
+jumpFolder.add(params, 'jumpThrustAccel', 5, 80, 1).name('thrust accel');
+jumpFolder.add(params, 'jumpThrustTime', 0.05, 0.5, 0.01).name('thrust time');
+jumpFolder.add(params, 'gravityUp', 2, 20, 0.5).name('gravity up');
+jumpFolder.add(params, 'gravityDown', 1, 12, 0.5).name('gravity down');
+
+const trailFolder = gui.addFolder('Trail');
+trailFolder.add(params, 'trailRadius', 0.002, 0.05, 0.001).name('radius');
+trailFolder.add(params, 'trailLifetime', 0.2, 4, 0.1).name('lifetime');
+trailFolder.add(params, 'trailSpacing', 0.005, 0.1, 0.005).name('spacing');
+trailFolder.addColor(params, 'trailColor').name('color')
+    .onChange((v) => TRAIL_COLOR.set(v));
+
+const bobFolder = gui.addFolder('Bobbing');
+bobFolder.add(params, 'bobXZ', 0, 0.1, 0.005).name('amp X/Z');
+bobFolder.add(params, 'bobY', 0, 0.1, 0.005).name('amp Y');
+
+const particleFolder = gui.addFolder('Particles');
+particleFolder.add(particleMaterial.uniforms.uLightRange, 'value', 0.5, 10, 0.1).name('light range');
+particleFolder.add(particleMaterial.uniforms.uSizeScale, 'value', 1, 20, 0.5).name('size');
+particleFolder.addColor(params, 'particleLightColor').name('light color')
+    .onChange((v) => particleMaterial.uniforms.uLightColor.value.set(v));
 
 function animate() {
     const dt = Math.min(clock.getDelta(), 0.05);
@@ -384,10 +433,10 @@ function animate() {
         (keys.s ? 1 : 0) - (keys.w ? 1 : 0)
     );
     if (moveDir.lengthSq() > 0) moveDir.normalize();
-    targetVelocity.set(moveDir.x * MOVE_SPEED, 0, moveDir.z * MOVE_SPEED);
+    targetVelocity.set(moveDir.x * params.moveSpeed, 0, moveDir.z * params.moveSpeed);
 
     // Exponential easing toward target velocity (frame-rate independent)
-    const smoothing = 1 - Math.exp(-ACCEL_RATE * dt);
+    const smoothing = 1 - Math.exp(-params.accelRate * dt);
     velocity.x += (targetVelocity.x - velocity.x) * smoothing;
     velocity.z += (targetVelocity.z - velocity.z) * smoothing;
 
@@ -398,11 +447,11 @@ function animate() {
     // zero instead of starting at full speed.
     if (jumpThrustTime > 0) {
         const thrustStep = Math.min(jumpThrustTime, dt);
-        velocityY += JUMP_THRUST_ACCEL * thrustStep;
+        velocityY += params.jumpThrustAccel * thrustStep;
         jumpThrustTime -= dt;
     }
 
-    velocityY -= (velocityY > 0 ? GRAVITY_UP : GRAVITY_DOWN) * dt;
+    velocityY -= (velocityY > 0 ? params.gravityUp : params.gravityDown) * dt;
 
     // Soft landing — exponentially damp downward velocity as we approach
     // the hover plane, so the fall eases out at the very end.
@@ -422,22 +471,22 @@ function animate() {
 
     // Bobbing is more intense when idle; scales down when moving at speed
     const speed = Math.hypot(velocity.x, velocity.z);
-    const idleFactor = 1 - Math.min(1, speed / MOVE_SPEED);
+    const idleFactor = 1 - Math.min(1, speed / params.moveSpeed);
     const bobScale = 1 + idleFactor * 3.5;
 
     // Quasi-random bobbing via summed sines on each axis
     const t = clock.elapsedTime;
     const bobX =
         (Math.sin(t * 1.1 + 0.7) * 0.6 + Math.sin(t * 1.9 + 2.1) * 0.4) *
-        BOB_AMP_XZ *
+        params.bobXZ *
         bobScale;
     const bobY =
         (Math.sin(t * 1.7) * 0.6 + Math.sin(t * 2.3 + 1.2) * 0.4) *
-        BOB_AMP_Y *
+        params.bobY *
         bobScale;
     const bobZ =
         (Math.sin(t * 1.3 + 1.5) * 0.6 + Math.sin(t * 2.1 + 0.3) * 0.4) *
-        BOB_AMP_XZ *
+        params.bobXZ *
         bobScale;
     orb.position.set(
         targetPos.x + bobX,
