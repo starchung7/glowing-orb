@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import GUI from 'lil-gui';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 await RAPIER.init();
 
@@ -24,6 +25,8 @@ const params = {
     bobIdleBoost: 5, // extra bob amplitude multiplier when idle vs moving
     bobResponse: 6,    // how fast bob amplitude eases in/out (lower = gentler)
     particleLightColor: '#ccccff',
+    treeCount: 16,  // total scattered trees (split across the variations)
+    treeScale: 1.0, // global size multiplier for all trees
 };
 
 const scene = new THREE.Scene();
@@ -358,6 +361,156 @@ const particles = new THREE.Points(particleGeo, particleMaterial);
 particles.frustumCulled = false;
 scene.add(particles);
 
+// --- Procedural low-poly dead trees ---
+// Each tree is generated once as a recursive set of tapered cylinders, merged
+// into a single geometry, then scattered with InstancedMesh so all copies of a
+// variation render in one draw call. They use a standard material so the orb's
+// point light glows across them as it passes near.
+const TREE_UP = new THREE.Vector3(0, 1, 0);
+
+function makeRng(seed) {
+    let a = seed >>> 0;
+    return () => {
+        a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+function buildDeadTreeGeometry(opts) {
+    const rng = makeRng(opts.seed);
+    const parts = [];
+    const radialSegments = 8; // rounder, more cylindrical branches
+
+    function grow(ox, oy, oz, dx, dy, dz, length, radius, depth) {
+        const seg = new THREE.CylinderGeometry(
+            radius * opts.taper, radius, length, radialSegments, 1
+        );
+        seg.translate(0, length / 2, 0); // base at origin, growing along +Y
+
+        const dir = new THREE.Vector3(dx, dy, dz).normalize();
+        const quat = new THREE.Quaternion().setFromUnitVectors(TREE_UP, dir);
+        const mat = new THREE.Matrix4().makeRotationFromQuaternion(quat);
+        mat.setPosition(ox, oy, oz);
+        seg.applyMatrix4(mat);
+        parts.push(seg);
+
+        if (depth >= opts.maxDepth || radius < opts.minRadius) return;
+
+        const ex = ox + dir.x * length;
+        const ey = oy + dir.y * length;
+        const ez = oz + dir.z * length;
+
+        // Orthonormal basis around the current direction for tilting children.
+        const ref = Math.abs(dir.y) > 0.99
+            ? new THREE.Vector3(1, 0, 0)
+            : new THREE.Vector3(0, 1, 0);
+        const side = new THREE.Vector3().crossVectors(dir, ref).normalize();
+        const fwd = new THREE.Vector3().crossVectors(side, dir).normalize();
+
+        const children = 2 + (rng() < opts.thirdBranchChance ? 1 : 0);
+        for (let i = 0; i < children; i++) {
+            const tilt = opts.branchAngle * (0.6 + rng() * 0.8);
+            const az = rng() * Math.PI * 2;
+            const offset = new THREE.Vector3()
+                .addScaledVector(side, Math.cos(az))
+                .addScaledVector(fwd, Math.sin(az));
+            const childDir = dir.clone()
+                .multiplyScalar(Math.cos(tilt))
+                .addScaledVector(offset, Math.sin(tilt))
+                .normalize();
+            const lenScale = opts.lengthFalloff * (0.8 + rng() * 0.4);
+            grow(
+                ex, ey, ez,
+                childDir.x, childDir.y, childDir.z,
+                length * lenScale, radius * opts.radiusFalloff, depth + 1
+            );
+        }
+    }
+
+    grow(0, 0, 0, 0, 1, 0, opts.height, opts.baseRadius, 0);
+
+    const merged = mergeGeometries(parts, false);
+    parts.forEach((g) => g.dispose());
+    merged.computeVertexNormals();
+    return merged;
+}
+
+const treeMaterial = new THREE.MeshStandardMaterial({
+    color: 0x241f1b,
+    roughness: 0.95,
+    metalness: 0.0,
+});
+
+// Two distinct silhouettes: a taller sparse tree and a shorter gnarlier one.
+const treeVariations = [
+    buildDeadTreeGeometry({
+        seed: 1337, height: 1.2, baseRadius: 0.06, taper: 0.7,
+        branchAngle: 0.5, maxDepth: 4, lengthFalloff: 0.78,
+        radiusFalloff: 0.64, minRadius: 0.008, thirdBranchChance: 0.35,
+    }),
+    buildDeadTreeGeometry({
+        seed: 9001, height: 0.85, baseRadius: 0.075, taper: 0.64,
+        branchAngle: 0.85, maxDepth: 5, lengthFalloff: 0.72,
+        radiusFalloff: 0.6, minRadius: 0.008, thirdBranchChance: 0.6,
+    }),
+];
+
+// Scatter instances in a ring around the play area, avoiding the centre/boxes.
+// Rebuildable so the GUI can change the count and global scale live.
+const TREE_RING_MIN = 4.0;
+const TREE_RING_MAX = 7.5;
+const _treePos = new THREE.Vector3();
+const _treeQuat = new THREE.Quaternion();
+const _treeScale = new THREE.Vector3();
+const _treeMatrix = new THREE.Matrix4();
+let treeInstances = [];
+
+function rebuildTrees() {
+    for (const inst of treeInstances) {
+        scene.remove(inst);
+        inst.dispose();
+    }
+    treeInstances = [];
+
+    const total = Math.max(0, params.treeCount | 0);
+    const nv = treeVariations.length;
+    // Round-robin how many instances each variation gets.
+    const counts = treeVariations.map(
+        (_, vi) => Math.floor(total / nv) + (vi < total % nv ? 1 : 0)
+    );
+    const meshes = treeVariations.map((geo, vi) =>
+        counts[vi] > 0 ? new THREE.InstancedMesh(geo, treeMaterial, counts[vi]) : null
+    );
+    const localIdx = new Array(nv).fill(0);
+
+    const rng = makeRng(424242); // fixed seed → stable layout
+    for (let i = 0; i < total; i++) {
+        const vi = i % nv;
+        const mesh = meshes[vi];
+        if (!mesh) continue;
+        // Stratified angle across the whole ring for an even spread.
+        const angle = ((i + rng()) / total) * Math.PI * 2;
+        const radius = TREE_RING_MIN + rng() * (TREE_RING_MAX - TREE_RING_MIN);
+        _treePos.set(Math.cos(angle) * radius, 0, Math.sin(angle) * radius);
+        _treeQuat.setFromAxisAngle(TREE_UP, rng() * Math.PI * 2);
+        const s = (0.8 + rng() * 0.5) * params.treeScale;
+        _treeScale.set(s, s * (0.9 + rng() * 0.35), s);
+        _treeMatrix.compose(_treePos, _treeQuat, _treeScale);
+        mesh.setMatrixAt(localIdx[vi]++, _treeMatrix);
+    }
+
+    for (const mesh of meshes) {
+        if (!mesh) continue;
+        mesh.instanceMatrix.needsUpdate = true;
+        scene.add(mesh);
+        treeInstances.push(mesh);
+    }
+}
+
+rebuildTrees();
+
 // 3/4 view: above the orb, tilted forward
 const cameraOffset = new THREE.Vector3(0, 1.8, 1.8);
 
@@ -474,6 +627,10 @@ particleFolder.add(particleMaterial.uniforms.uLightRange, 'value', 0.5, 10, 0.1)
 particleFolder.add(particleMaterial.uniforms.uSizeScale, 'value', 1, 20, 0.5).name('size');
 particleFolder.addColor(params, 'particleLightColor').name('light color')
     .onChange((v) => particleMaterial.uniforms.uLightColor.value.set(v));
+
+const treeFolder = gui.addFolder('Trees');
+treeFolder.add(params, 'treeCount', 0, 40, 1).name('count').onChange(rebuildTrees);
+treeFolder.add(params, 'treeScale', 0.3, 3, 0.05).name('scale').onChange(rebuildTrees);
 
 function animate() {
     const dt = Math.min(clock.getDelta(), 0.05);
