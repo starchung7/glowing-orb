@@ -43,22 +43,24 @@ const camera = new THREE.PerspectiveCamera(
 );
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+// Cap pixel ratio at 1.5 — on hi-DPI displays this roughly halves fragment work
+// versus 2x with little visible quality loss.
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
 document.body.appendChild(renderer.domElement);
 
-// Glossy black floor. Dithering breaks up colour banding ("stepping") in the
-// dark floor-to-fog gradient, which 8-bit output would otherwise quantize.
+// Glossy black floor. Uses the lighter MeshStandardMaterial (no clearcoat lobe)
+// since the floor fills the screen and is the heaviest fragment shader; low
+// roughness keeps a subtle sheen. Dithering breaks up colour banding
+// ("stepping") in the dark floor-to-fog gradient that 8-bit output would quantize.
 const floor = new THREE.Mesh(
     new THREE.PlaneGeometry(80, 80),
-    new THREE.MeshPhysicalMaterial({
+    new THREE.MeshStandardMaterial({
         color: 0x050505,
         roughness: 0.2,
         metalness: 0.0,
-        clearcoat: 1.0,
-        clearcoatRoughness: 0.05,
         dithering: true,
     })
 );
