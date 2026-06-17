@@ -24,7 +24,8 @@ const params = {
     bobIdleBoost: 5, // extra bob amplitude multiplier when idle vs moving
     bobResponse: 6,    // how fast bob amplitude eases in/out (lower = gentler)
     particleLightColor: '#ccccff',
-    fogColor: '#7171fe',      // soft blue-white haze
+    boxColor: '#ffffff',
+    fogColor: '#8a8aff',      // soft blue-white haze
     fogDensity: 0.086,
 };
 
@@ -110,7 +111,7 @@ world.createCollider(RAPIER.ColliderDesc.ball(ORB_PHYS_RADIUS), orbBody);
 const BOX_SIZE = 0.3;
 const boxGeo = new THREE.BoxGeometry(BOX_SIZE, BOX_SIZE, BOX_SIZE);
 const boxMat = new THREE.MeshPhysicalMaterial({
-    color: 0x262630,
+    color: params.boxColor,
     roughness: 0.35,
     metalness: 0.05,
     clearcoat: 0.7,
@@ -504,6 +505,10 @@ particleFolder.add(particleMaterial.uniforms.uLightRange, 'value', 0.5, 10, 0.1)
 particleFolder.add(particleMaterial.uniforms.uSizeScale, 'value', 1, 20, 0.5).name('size');
 particleFolder.addColor(params, 'particleLightColor').name('light color')
     .onChange((v) => particleMaterial.uniforms.uLightColor.value.set(v));
+
+const boxFolder = gui.addFolder('Boxes');
+boxFolder.addColor(params, 'boxColor').name('color')
+    .onChange((v) => boxMat.color.set(v));
 
 const fogFolder = gui.addFolder('Fog');
 fogFolder.addColor(params, 'fogColor').name('sky / fog').onChange((v) => {
