@@ -426,6 +426,9 @@ window.addEventListener('keydown', (e) => {
         resetIdle();
         e.preventDefault();
     }
+    if (e.code === 'KeyH') {
+        gui._hidden ? gui.show() : gui.hide();
+    }
 });
 window.addEventListener('keyup', (e) => {
     const action = keyMap[e.code];
