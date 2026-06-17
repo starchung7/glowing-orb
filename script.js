@@ -316,6 +316,7 @@ const particleMaterial = new THREE.ShaderMaterial({
         uLightRange: { value: PARTICLE_LIGHT_RANGE },
         uSizeScale: { value: 7.0 },
         uPixelRatio: { value: renderer.getPixelRatio() },
+        uHalfExtent: { value: PARTICLE_AREA },
     },
     vertexShader: /* glsl */ `
         uniform float uTime;
@@ -323,14 +324,28 @@ const particleMaterial = new THREE.ShaderMaterial({
         uniform float uLightRange;
         uniform float uSizeScale;
         uniform float uPixelRatio;
+        uniform float uHalfExtent;
         attribute float aSize;
         attribute vec3 aDrift;
         attribute float aPhase;
         varying float vAtten;
         varying float vTwinkle;
+        varying float vEdgeFade;
 
         void main() {
             vec3 p = position;
+            // Wrap the static particle field toroidally around the orb so the
+            // same point cloud always surrounds the camera target — infinite
+            // coverage as you roam, without spawning more particles. Particles
+            // that wrap teleport across the far edge of the region.
+            float span = uHalfExtent * 2.0;
+            p.x = mod(p.x - uOrbPos.x + uHalfExtent, span) - uHalfExtent + uOrbPos.x;
+            p.z = mod(p.z - uOrbPos.z + uHalfExtent, span) - uHalfExtent + uOrbPos.z;
+            // Fade alpha to zero in the outer band of the region so a particle
+            // is fully invisible at the instant it wraps across an edge — kills
+            // the faint ambient "pop" the lighting term alone wouldn't hide.
+            float edge = max(abs(p.x - uOrbPos.x), abs(p.z - uOrbPos.z)) / uHalfExtent;
+            vEdgeFade = smoothstep(1.0, 0.85, edge);
             // Bounded floating drift, fully GPU-side (no CPU updates).
             p.x += sin(uTime * 0.30 + aPhase) * aDrift.x;
             p.y += sin(uTime * 0.40 + aPhase * 1.7) * aDrift.y;
@@ -352,6 +367,7 @@ const particleMaterial = new THREE.ShaderMaterial({
         uniform vec3 uAmbient;
         varying float vAtten;
         varying float vTwinkle;
+        varying float vEdgeFade;
 
         void main() {
             vec2 uv = gl_PointCoord - 0.5;
@@ -359,7 +375,7 @@ const particleMaterial = new THREE.ShaderMaterial({
             if (r > 0.5) discard;
             float soft = smoothstep(0.5, 0.0, r);
             vec3 col = uAmbient + uLightColor * vAtten;
-            float alpha = soft * (0.12 + vAtten) * vTwinkle;
+            float alpha = soft * (0.12 + vAtten) * vTwinkle * vEdgeFade;
             gl_FragColor = vec4(col, alpha);
         }
     `,
