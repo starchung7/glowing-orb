@@ -49,7 +49,8 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
 document.body.appendChild(renderer.domElement);
 
-// Glossy black floor
+// Glossy black floor. Dithering breaks up colour banding ("stepping") in the
+// dark floor-to-fog gradient, which 8-bit output would otherwise quantize.
 const floor = new THREE.Mesh(
     new THREE.PlaneGeometry(80, 80),
     new THREE.MeshPhysicalMaterial({
@@ -58,6 +59,7 @@ const floor = new THREE.Mesh(
         metalness: 0.0,
         clearcoat: 1.0,
         clearcoatRoughness: 0.05,
+        dithering: true,
     })
 );
 floor.rotation.x = -Math.PI / 2;
@@ -111,6 +113,7 @@ const boxMat = new THREE.MeshPhysicalMaterial({
     metalness: 0.05,
     clearcoat: 0.7,
     clearcoatRoughness: 0.15,
+    dithering: true,
 });
 const boxes = [];
 const BOX_LAYOUT = [
