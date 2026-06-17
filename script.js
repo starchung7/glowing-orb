@@ -24,15 +24,13 @@ const params = {
     bobIdleBoost: 5, // extra bob amplitude multiplier when idle vs moving
     bobResponse: 6,    // how fast bob amplitude eases in/out (lower = gentler)
     particleLightColor: '#ccccff',
-    fogColor: '#8a9bb5',      // foggy blue-grey swamp haze
+    fogColor: '#8a9bb5',      // foggy blue-grey haze
     fogDensity: 0.045,
-    waterLevel: -0.25,        // y-height the water plane sits at
-    terrainAmplitude: 1.2,    // overall hill/pocket height
 };
 
 const scene = new THREE.Scene();
-// Foggy swamp atmosphere: the sky/background and exponential fog share a colour
-// so the terrain dissolves into the haze toward the horizon.
+// Foggy atmosphere: the sky/background and exponential fog share a colour so
+// the scene dissolves into the haze toward the horizon.
 const skyColor = new THREE.Color(params.fogColor);
 scene.background = skyColor;
 scene.fog = new THREE.FogExp2(skyColor.clone(), params.fogDensity);
@@ -51,109 +49,19 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
 document.body.appendChild(renderer.domElement);
 
-// --- Swamp terrain + water ---
-// The terrain is a subdivided plane displaced by layered value noise (fBm). A
-// flat translucent water plane sits at a fixed level, so wherever the terrain
-// dips below it, water naturally fills the pocket. The central play area is kept
-// flat (y ~ 0) via a radial mask so movement/physics stay stable there.
-const TERRAIN_SIZE = 80;
-const TERRAIN_SEGMENTS = 160;
-const TERRAIN_NOISE_SCALE = 0.09; // lower = broader, gentler hills
-const TERRAIN_FLAT_RADIUS = 3.0;  // keep this central radius flat
-const TERRAIN_RAMP = 7.0;         // distance over which elevation ramps in
-
-function hash2(x, y) {
-    const h = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
-    return h - Math.floor(h);
-}
-function valueNoise(x, y) {
-    const xi = Math.floor(x), yi = Math.floor(y);
-    const xf = x - xi, yf = y - yi;
-    const u = xf * xf * (3 - 2 * xf);
-    const v = yf * yf * (3 - 2 * yf);
-    const a = hash2(xi, yi);
-    const b = hash2(xi + 1, yi);
-    const c = hash2(xi, yi + 1);
-    const d = hash2(xi + 1, yi + 1);
-    const top = a + (b - a) * u;
-    const bot = c + (d - c) * u;
-    return top + (bot - top) * v; // [0, 1)
-}
-function fbm(x, y) {
-    let amp = 0.5, freq = 1, sum = 0, norm = 0;
-    for (let o = 0; o < 4; o++) {
-        sum += amp * valueNoise(x * freq, y * freq);
-        norm += amp;
-        amp *= 0.5;
-        freq *= 2;
-    }
-    return sum / norm; // [0, 1)
-}
-function smoothstep01(edge0, edge1, x) {
-    const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
-    return t * t * (3 - 2 * t);
-}
-function terrainHeight(x, z) {
-    const n = fbm(x * TERRAIN_NOISE_SCALE + 100, z * TERRAIN_NOISE_SCALE + 100);
-    const h = (n - 0.5) * 2; // [-1, 1]
-    const mask = smoothstep01(
-        TERRAIN_FLAT_RADIUS, TERRAIN_FLAT_RADIUS + TERRAIN_RAMP, Math.hypot(x, z)
-    );
-    return h * params.terrainAmplitude * mask;
-}
-
-const terrainLow = new THREE.Color(0x2c3a30);  // wet, low ground
-const terrainHigh = new THREE.Color(0x6b6450); // drier, higher ground
-const terrainMaterial = new THREE.MeshStandardMaterial({
-    vertexColors: true,
-    roughness: 1.0,
-    metalness: 0.0,
-});
-
-function buildTerrainGeometry() {
-    const geo = new THREE.PlaneGeometry(
-        TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEGMENTS, TERRAIN_SEGMENTS
-    );
-    geo.rotateX(-Math.PI / 2); // lie flat in the XZ plane
-    const pos = geo.attributes.position;
-    const colors = new Float32Array(pos.count * 3);
-    const c = new THREE.Color();
-    for (let i = 0; i < pos.count; i++) {
-        const x = pos.getX(i), z = pos.getZ(i);
-        const y = terrainHeight(x, z);
-        pos.setY(i, y);
-        const t = smoothstep01(-0.4, 1.0, y);
-        c.copy(terrainLow).lerp(terrainHigh, t);
-        colors[i * 3] = c.r;
-        colors[i * 3 + 1] = c.g;
-        colors[i * 3 + 2] = c.b;
-    }
-    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    pos.needsUpdate = true;
-    geo.computeVertexNormals();
-    return geo;
-}
-
-const terrain = new THREE.Mesh(buildTerrainGeometry(), terrainMaterial);
-scene.add(terrain);
-
-function rebuildTerrain() {
-    terrain.geometry.dispose();
-    terrain.geometry = buildTerrainGeometry();
-}
-
-const water = new THREE.Mesh(
-    new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE).rotateX(-Math.PI / 2),
-    new THREE.MeshStandardMaterial({
-        color: 0x3b5566,
-        transparent: true,
-        opacity: 0.72,
-        roughness: 0.15,
+// Glossy black floor
+const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(80, 80),
+    new THREE.MeshPhysicalMaterial({
+        color: 0x050505,
+        roughness: 0.2,
         metalness: 0.0,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.05,
     })
 );
-water.position.y = params.waterLevel;
-scene.add(water);
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
 
 // Tiny glowing orb — same radius as the trail tube so they sit flush
 const orb = new THREE.Mesh(
@@ -358,13 +266,9 @@ function updateTrail(dt) {
     trailMesh.visible = true;
 }
 
-// Soft, foggy daylight — gentle ambient + hemisphere fill plus a low directional
-// key so the terrain reads with shape but no harsh shadows.
-scene.add(new THREE.AmbientLight(0xa9b8cc, 0.45));
-scene.add(new THREE.HemisphereLight(0xc3d2e4, 0x33402f, 0.6));
-const keyLight = new THREE.DirectionalLight(0xd2dcea, 0.55);
-keyLight.position.set(-6, 9, -4);
-scene.add(keyLight);
+// Subtle ambient + hemisphere fill so the floor isn't pitch black everywhere
+scene.add(new THREE.AmbientLight(0xffffff, 0.08));
+scene.add(new THREE.HemisphereLight(0xffffff, 0x101010, 0.15));
 
 // Floating dust particles — a single GPU point cloud (one draw call) whose
 // brightness reacts to the orb's light. Lighting and drift are computed in the
@@ -496,8 +400,7 @@ let velocityY = 0;
 let jumpThrustTime = 0;          // remaining propulsion time
 let bobScaleSmooth = 1;          // eased bob amplitude factor (avoids snapping)
 
-const isGrounded = () =>
-    targetPos.y <= terrainHeight(targetPos.x, targetPos.z) + HOVER_HEIGHT + 1e-3;
+const isGrounded = () => targetPos.y <= HOVER_HEIGHT + 1e-4;
 
 const keyMap = {
     KeyW: 'w', ArrowUp: 'w',
@@ -578,17 +481,13 @@ particleFolder.add(particleMaterial.uniforms.uSizeScale, 'value', 1, 20, 0.5).na
 particleFolder.addColor(params, 'particleLightColor').name('light color')
     .onChange((v) => particleMaterial.uniforms.uLightColor.value.set(v));
 
-const swampFolder = gui.addFolder('Swamp');
-swampFolder.addColor(params, 'fogColor').name('sky / fog').onChange((v) => {
+const fogFolder = gui.addFolder('Fog');
+fogFolder.addColor(params, 'fogColor').name('sky / fog').onChange((v) => {
     scene.background.set(v);
     scene.fog.color.set(v);
 });
-swampFolder.add(params, 'fogDensity', 0, 0.15, 0.002).name('fog density')
+fogFolder.add(params, 'fogDensity', 0, 0.15, 0.002).name('fog density')
     .onChange((v) => { scene.fog.density = v; });
-swampFolder.add(params, 'waterLevel', -1.5, 1.5, 0.01).name('water level')
-    .onChange((v) => { water.position.y = v; });
-swampFolder.add(params, 'terrainAmplitude', 0, 3, 0.05).name('terrain height')
-    .onFinishChange(rebuildTerrain);
 
 gui.close(); // start collapsed
 
@@ -621,14 +520,10 @@ function animate() {
 
     velocityY -= (velocityY > 0 ? params.gravityUp : params.gravityDown) * dt;
 
-    // Hover relative to the terrain beneath the orb so it rides over hills and
-    // pockets instead of clipping into them.
-    const restY = terrainHeight(targetPos.x, targetPos.z) + HOVER_HEIGHT;
-
     // Soft landing — exponentially damp downward velocity as we approach
     // the hover plane, so the fall eases out at the very end.
     if (velocityY < 0) {
-        const heightAbove = targetPos.y - restY;
+        const heightAbove = targetPos.y - HOVER_HEIGHT;
         if (heightAbove > 0 && heightAbove < SOFT_LAND_DISTANCE) {
             const proximity = 1 - heightAbove / SOFT_LAND_DISTANCE;
             velocityY *= Math.exp(-SOFT_LAND_DAMPING * proximity * dt);
@@ -636,8 +531,8 @@ function animate() {
     }
 
     targetPos.y += velocityY * dt;
-    if (targetPos.y < restY) {
-        targetPos.y = restY;
+    if (targetPos.y < HOVER_HEIGHT) {
+        targetPos.y = HOVER_HEIGHT;
         velocityY = 0;
     }
 
