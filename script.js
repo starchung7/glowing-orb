@@ -24,7 +24,7 @@ const params = {
     bobIdleBoost: 5, // extra bob amplitude multiplier when idle vs moving
     bobResponse: 6,    // how fast bob amplitude eases in/out (lower = gentler)
     particleLightColor: '#ccccff',
-    fogColor: '#ccccff',      // soft blue-white haze
+    fogColor: '#7171fe',      // soft blue-white haze
     fogDensity: 0.086,
 };
 
