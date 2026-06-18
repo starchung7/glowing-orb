@@ -172,9 +172,10 @@ function syncComposerSize() {
 }
 syncComposerSize();
 
-// Floor plane. Created with a placeholder material here; it's re-skinned below
-// (after the grass material exists) with a shader that matches the grass lighting
-// so the ground and the blade bases read as the same surface.
+// Glossy black floor. Uses the lighter MeshStandardMaterial (no clearcoat lobe)
+// since the floor fills the screen and is the heaviest fragment shader; low
+// roughness keeps a subtle sheen. Dithering breaks up colour banding
+// ("stepping") in the dark floor-to-fog gradient that 8-bit output would quantize.
 const floor = new THREE.Mesh(
     new THREE.PlaneGeometry(80, 80),
     new THREE.MeshStandardMaterial({
@@ -968,10 +969,7 @@ grassFolder.add(params, 'grassWindStrength', 0, 1.5, 0.05).name('wind')
 grassFolder.add(params, 'grassLightRange', 1, 12, 0.5).name('glow range')
     .onChange((v) => { grassMaterial.uniforms.uOrbRange.value = v; });
 grassFolder.addColor(params, 'grassColorBase').name('base color')
-    .onChange((v) => {
-        // Shared uniform — updates both the grass base and the floor at once.
-        grassMaterial.uniforms.uColorBase.value.set(v);
-    });
+    .onChange((v) => grassMaterial.uniforms.uColorBase.value.set(v));
 grassFolder.addColor(params, 'grassColorTip').name('tip color')
     .onChange((v) => grassMaterial.uniforms.uColorTip.value.set(v));
 
