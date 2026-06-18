@@ -1,6 +1,11 @@
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import GUI from 'lil-gui';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 
 await RAPIER.init();
 
@@ -27,6 +32,8 @@ const params = {
     boxColor: '#ffffff',
     fogColor: '#8a8aff',      // soft blue-white haze
     fogDensity: 0.086,
+    dofBlur: 2.5,             // max edge blur radius (texels)
+    dofStart: 0.45,           // where the blur begins (0 = center, 1 = corner)
 };
 
 const scene = new THREE.Scene();
@@ -44,13 +51,109 @@ const camera = new THREE.PerspectiveCamera(
 );
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-// Cap pixel ratio at 1.5 — on hi-DPI displays this roughly halves fragment work
-// versus 2x with little visible quality loss.
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+// Floor the pixel ratio at 2 — supersamples on low-DPI displays to keep edges
+// crisp (heavier fragment work, but reduces aliasing/stepping).
+renderer.setPixelRatio(Math.max(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
 document.body.appendChild(renderer.domElement);
+
+// --- Post-processing: fake depth-of-field via a radial edge blur ---
+// A separable Gaussian blur whose strength ramps from zero at the screen centre
+// to uMaxBlur at the corners. The centre stays crisp (sample offsets collapse to
+// zero, weights sum to 1 → no-op) so it reads as a shallow depth of field
+// without the cost of a true depth-based bokeh pass. Run as two passes
+// (horizontal then vertical) which together form a 2D blur cheaply.
+const RadialBlurShader = {
+    uniforms: {
+        tDiffuse: { value: null },
+        uResolution: { value: new THREE.Vector2() },
+        uDirection: { value: new THREE.Vector2(1, 0) },
+        uMaxBlur: { value: params.dofBlur },
+        uStart: { value: params.dofStart },
+    },
+    vertexShader: /* glsl */ `
+        varying vec2 vUv;
+        void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+    `,
+    fragmentShader: /* glsl */ `
+        uniform sampler2D tDiffuse;
+        uniform vec2 uResolution;
+        uniform vec2 uDirection;
+        uniform float uMaxBlur;
+        uniform float uStart;
+        varying vec2 vUv;
+
+        void main() {
+            // Normalised distance from centre: 0 at centre, 1 at a corner.
+            vec2 c = vUv - 0.5;
+            float dist = length(c) / 0.7071068;
+            float edge = smoothstep(uStart, 1.0, dist);
+            float radius = edge * uMaxBlur;
+
+            vec2 texel = uDirection / uResolution;
+            // 9-tap Gaussian (weights sum to 1).
+            vec4 sum = texture2D(tDiffuse, vUv) * 0.227027;
+            vec2 o1 = texel * radius;
+            vec2 o2 = texel * radius * 2.0;
+            vec2 o3 = texel * radius * 3.0;
+            vec2 o4 = texel * radius * 4.0;
+            sum += texture2D(tDiffuse, vUv + o1) * 0.1945946;
+            sum += texture2D(tDiffuse, vUv - o1) * 0.1945946;
+            sum += texture2D(tDiffuse, vUv + o2) * 0.1216216;
+            sum += texture2D(tDiffuse, vUv - o2) * 0.1216216;
+            sum += texture2D(tDiffuse, vUv + o3) * 0.054054;
+            sum += texture2D(tDiffuse, vUv - o3) * 0.054054;
+            sum += texture2D(tDiffuse, vUv + o4) * 0.016216;
+            sum += texture2D(tDiffuse, vUv - o4) * 0.016216;
+            gl_FragColor = sum;
+        }
+    `,
+};
+
+// Offscreen HDR buffer for the post chain (composer's default target is already
+// HalfFloat). No MSAA here: pixel-ratio supersampling smooths geometry edges,
+// and the final SMAA pass cleans up remaining luminance edges far more cheaply.
+const composer = new EffectComposer(renderer);
+composer.setPixelRatio(renderer.getPixelRatio());
+composer.addPass(new RenderPass(scene, camera));
+
+const blurH = new ShaderPass(RadialBlurShader);
+blurH.uniforms.uDirection.value.set(1, 0);
+composer.addPass(blurH);
+
+const blurV = new ShaderPass(RadialBlurShader);
+blurV.uniforms.uDirection.value.set(0, 1);
+composer.addPass(blurV);
+
+// Applies tone mapping + sRGB conversion at the end of the chain, since the
+// composer's render targets bypass the renderer's automatic output conversion.
+composer.addPass(new OutputPass());
+
+// Post-process antialiasing on the final sRGB image. SMAA smooths luminance
+// edges (incl. the thin, very high-contrast glow trail) that MSAA's limited
+// coverage samples still leave stepped — far cheaper than supersampling. Sized
+// in device pixels; EffectComposer.setSize keeps it in sync on resize.
+const smaaPass = new SMAAPass(
+    window.innerWidth * renderer.getPixelRatio(),
+    window.innerHeight * renderer.getPixelRatio(),
+);
+composer.addPass(smaaPass);
+
+const dofPasses = [blurH, blurV];
+function syncComposerSize() {
+    composer.setPixelRatio(renderer.getPixelRatio());
+    composer.setSize(window.innerWidth, window.innerHeight);
+    const pr = renderer.getPixelRatio();
+    const w = window.innerWidth * pr;
+    const h = window.innerHeight * pr;
+    for (const p of dofPasses) p.uniforms.uResolution.value.set(w, h);
+}
+syncComposerSize();
 
 // Glossy black floor. Uses the lighter MeshStandardMaterial (no clearcoat lobe)
 // since the floor fills the screen and is the heaviest fragment shader; low
@@ -457,6 +560,7 @@ window.addEventListener('resize', () => {
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
     particleMaterial.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+    syncComposerSize();
 });
 
 const clock = new THREE.Clock();
@@ -517,6 +621,16 @@ fogFolder.addColor(params, 'fogColor').name('sky / fog').onChange((v) => {
 });
 fogFolder.add(params, 'fogDensity', 0, 0.15, 0.002).name('fog density')
     .onChange((v) => { scene.fog.density = v; });
+
+const dofFolder = gui.addFolder('Depth of Field');
+dofFolder.add(params, 'dofBlur', 0, 8, 0.1).name('edge blur').onChange((v) => {
+    blurH.uniforms.uMaxBlur.value = v;
+    blurV.uniforms.uMaxBlur.value = v;
+});
+dofFolder.add(params, 'dofStart', 0, 1, 0.01).name('blur start').onChange((v) => {
+    blurH.uniforms.uStart.value = v;
+    blurV.uniforms.uStart.value = v;
+});
 
 gui.close(); // start collapsed
 
@@ -627,7 +741,7 @@ function animate() {
     camera.position.copy(targetPos).add(cameraOffset);
     camera.lookAt(targetPos);
 
-    renderer.render(scene, camera);
+    composer.render();
     requestAnimationFrame(animate);
 }
 animate();
