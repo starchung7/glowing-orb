@@ -534,7 +534,9 @@ function makeNoiseTexture(size = 256, basePeriod = 8) {
         const b = v01 + (v11 - v01) * sx;
         return a + (b - a) * sz;
     };
-    const data = new Uint8Array(size * size * 4);
+    // Single channel: only the red channel is ever sampled, so a 1-byte/texel
+    // R8 texture uses a quarter of the memory of RGBA for the same result.
+    const data = new Uint8Array(size * size);
     for (let y = 0; y < size; y++) {
         for (let x = 0; x < size; x++) {
             const u = x / size, v = y / size;
@@ -548,12 +550,10 @@ function makeNoiseTexture(size = 256, basePeriod = 8) {
                 amp *= 0.5;
             }
             const n = Math.max(0, Math.min(1, sum / norm));
-            const i = (y * size + x) * 4;
-            const c = Math.round(n * 255);
-            data[i] = c; data[i + 1] = c; data[i + 2] = c; data[i + 3] = 255;
+            data[y * size + x] = Math.round(n * 255);
         }
     }
-    const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+    const tex = new THREE.DataTexture(data, size, size, THREE.RedFormat);
     tex.wrapS = THREE.RepeatWrapping;
     tex.wrapT = THREE.RepeatWrapping;
     tex.minFilter = THREE.LinearFilter;
@@ -682,10 +682,15 @@ const grassMaterial = new THREE.RawShaderMaterial({
             vec4 worldBase = modelMatrix * vec4(ground, 1.0);
             vec2 bladeXZ = worldBase.xz;
 
-            // Height: broad low-freq noise * per-blade randomness.
-            float hn = texture(uNoise, bladeXZ * uHeightNoiseScale).r + 0.5;
-            float height = uBladeHeight *
-                (uHeightRand * aHeightRand + (1.0 - uHeightRand)) * hn;
+            // Height + wind only move the tip vertex — the two base corners stay
+            // flat on the ground (shape.y = 0) and don't sway. So gate their noise
+            // texture fetches behind the tip test and skip them for ~2/3 of verts.
+            float height = 0.0;
+            if (tip > 0.5) {
+                float hn = texture(uNoise, bladeXZ * uHeightNoiseScale).r + 0.5;
+                height = uBladeHeight *
+                    (uHeightRand * aHeightRand + (1.0 - uHeightRand)) * hn;
+            }
 
             vec3 vertPos = ground + vec3(shape.x * uBladeWidth, shape.y * height, 0.0);
 
@@ -698,10 +703,12 @@ const grassMaterial = new THREE.RawShaderMaterial({
             float ca = cos(ang), sa = sin(ang);
             vertPos.xz = ground.xz + vec2(ca * d.x - sa * d.y, sa * d.x + ca * d.y);
 
-            // Wind sways the tip only, scaled by height.
-            vec2 wind = windOffset(bladeXZ) * tip * height * 2.0;
-            vertPos.x += wind.x;
-            vertPos.z += wind.y;
+            // Wind sways the tip only, scaled by height (base verts skipped above).
+            if (tip > 0.5) {
+                vec2 wind = windOffset(bladeXZ) * height * 2.0;
+                vertPos.x += wind.x;
+                vertPos.z += wind.y;
+            }
 
             vec4 world = modelMatrix * vec4(vertPos, 1.0);
             vWorldPos = world.xyz;
