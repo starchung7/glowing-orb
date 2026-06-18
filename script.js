@@ -172,15 +172,14 @@ function syncComposerSize() {
 }
 syncComposerSize();
 
-// Glossy black floor. Uses the lighter MeshStandardMaterial (no clearcoat lobe)
-// since the floor fills the screen and is the heaviest fragment shader; low
-// roughness keeps a subtle sheen. Dithering breaks up colour banding
-// ("stepping") in the dark floor-to-fog gradient that 8-bit output would quantize.
+// Matte black floor. Fully rough/non-metallic so it has no specular sheen or
+// reflections. Dithering breaks up colour banding ("stepping") in the dark
+// floor-to-fog gradient that 8-bit output would otherwise quantize.
 const floor = new THREE.Mesh(
     new THREE.PlaneGeometry(80, 80),
     new THREE.MeshStandardMaterial({
         color: 0x050505,
-        roughness: 0.2,
+        roughness: 1.0,
         metalness: 0.0,
         dithering: true,
     })
