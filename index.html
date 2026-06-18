@@ -74,6 +74,13 @@
         #idle-hint .key-left  { grid-column: 1; grid-row: 2; }
         #idle-hint .key-down  { grid-column: 2; grid-row: 2; }
         #idle-hint .key-right { grid-column: 3; grid-row: 2; }
+        /* Touch hint shown only on touch-primary (mobile/tablet) devices. */
+        #idle-hint .hint-touch { display: none; }
+        @media (pointer: coarse) {
+            #idle-hint .arrow-keys { display: none; }
+            #idle-hint .hint-desktop { display: none; }
+            #idle-hint .hint-touch { display: block; }
+        }
     </style>
 </head>
 <body>
@@ -85,7 +92,8 @@
             <div class="key key-down"><svg viewBox="0 0 12 12"><polygon points="6,9.5 2,3 10,3"/></svg></div>
             <div class="key key-right"><svg viewBox="0 0 12 12"><polygon points="9.5,6 3,2 3,10"/></svg></div>
         </div>
-        <div class="hint-text">Use the arrow keys to move around</div>
+        <div class="hint-text hint-desktop">Use the arrow keys to explore</div>
+        <div class="hint-text hint-touch">Drag to explore</div>
     </div>
     <script type="module" src="/script.js"></script>
 </body>

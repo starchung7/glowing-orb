@@ -565,6 +565,66 @@ window.addEventListener('keyup', (e) => {
     if (action) keys[action] = false;
 });
 
+// Touch controls — drag anywhere on the canvas to steer the orb like a virtual
+// joystick. The touch-start point is the anchor; the orb moves in the drag
+// direction, and speed scales with how far you drag (full speed past
+// TOUCH_MAX_RADIUS). Listeners live on the canvas so they don't fight the GUI.
+const TOUCH_MAX_RADIUS = 70; // px of drag for full speed
+const touchMove = { x: 0, z: 0 };
+let activeTouchId = null;
+let touchAnchorX = 0;
+let touchAnchorY = 0;
+
+renderer.domElement.style.touchAction = 'none'; // stop browser scroll/zoom gestures
+
+function updateTouchVector(clientX, clientY) {
+    let dx = (clientX - touchAnchorX) / TOUCH_MAX_RADIUS;
+    let dy = (clientY - touchAnchorY) / TOUCH_MAX_RADIUS;
+    const len = Math.hypot(dx, dy);
+    if (len > 1) { dx /= len; dy /= len; } // clamp magnitude to 1 (full speed)
+    // Screen +x → world +x; dragging down the screen (+y) pulls the orb toward
+    // the camera (+z), matching the 3/4 view.
+    touchMove.x = dx;
+    touchMove.z = dy;
+}
+
+renderer.domElement.addEventListener('touchstart', (e) => {
+    if (activeTouchId !== null) return;
+    const t = e.changedTouches[0];
+    activeTouchId = t.identifier;
+    touchAnchorX = t.clientX;
+    touchAnchorY = t.clientY;
+    touchMove.x = 0;
+    touchMove.z = 0;
+    resetIdle();
+    e.preventDefault();
+}, { passive: false });
+
+renderer.domElement.addEventListener('touchmove', (e) => {
+    if (activeTouchId === null) return;
+    for (const t of e.changedTouches) {
+        if (t.identifier === activeTouchId) {
+            updateTouchVector(t.clientX, t.clientY);
+            resetIdle();
+            e.preventDefault();
+            break;
+        }
+    }
+}, { passive: false });
+
+function endTouch(e) {
+    for (const t of e.changedTouches) {
+        if (t.identifier === activeTouchId) {
+            activeTouchId = null;
+            touchMove.x = 0;
+            touchMove.z = 0;
+            break;
+        }
+    }
+}
+renderer.domElement.addEventListener('touchend', endTouch);
+renderer.domElement.addEventListener('touchcancel', endTouch);
+
 window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
@@ -647,12 +707,18 @@ gui.close(); // start collapsed
 function animate() {
     const dt = Math.min(clock.getDelta(), 0.05);
 
-    moveDir.set(
-        (keys.d ? 1 : 0) - (keys.a ? 1 : 0),
-        0,
-        (keys.s ? 1 : 0) - (keys.w ? 1 : 0)
-    );
-    if (moveDir.lengthSq() > 0) moveDir.normalize();
+    // Keyboard input, normalised so diagonals aren't faster (full speed).
+    let inputX = (keys.d ? 1 : 0) - (keys.a ? 1 : 0);
+    let inputZ = (keys.s ? 1 : 0) - (keys.w ? 1 : 0);
+    const kbLen = Math.hypot(inputX, inputZ);
+    if (kbLen > 1) { inputX /= kbLen; inputZ /= kbLen; }
+    // Add the touch joystick (its magnitude already encodes partial speed), then
+    // clamp the combined vector so the two inputs can't stack past full speed.
+    inputX += touchMove.x;
+    inputZ += touchMove.z;
+    const inLen = Math.hypot(inputX, inputZ);
+    if (inLen > 1) { inputX /= inLen; inputZ /= inLen; }
+    moveDir.set(inputX, 0, inputZ);
     targetVelocity.set(moveDir.x * params.moveSpeed, 0, moveDir.z * params.moveSpeed);
 
     // Exponential easing toward target velocity (frame-rate independent)
