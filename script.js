@@ -96,6 +96,16 @@ const RadialBlurShader = {
             float radius = edge * uMaxBlur;
 
             vec2 texel = uDirection / uResolution;
+            // Early-out: in the sharp central region the blur radius is ~0, so the
+            // 8 offset taps would all resample the centre texel for no effect.
+            // Skip them — the whole crisp area takes this branch uniformly (no
+            // warp divergence), avoiding wasted texture fetches over most of the
+            // screen. Threshold is sub-texel so it never clips a visible blur.
+            if (radius * 4.0 < 0.5) {
+                gl_FragColor = texture2D(tDiffuse, vUv);
+                return;
+            }
+
             // 9-tap Gaussian (weights sum to 1).
             vec4 sum = texture2D(tDiffuse, vUv) * 0.227027;
             vec2 o1 = texel * radius;
