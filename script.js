@@ -9,6 +9,10 @@ import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 
 await RAPIER.init();
 
+// Touch devices (phones/tablets) tend to have far less GPU memory and fill rate,
+// so we lighten the heaviest work (grass vertex count + pixel ratio) for them.
+const isTouchDevice = window.matchMedia('(pointer: coarse)').matches;
+
 // Live-tunable parameters, exposed through the lil-gui panel below.
 const params = {
     orbRadius: 0.008,
@@ -34,7 +38,9 @@ const params = {
     fogDensity: 0.086,
     dofBlur: 2.5,             // max edge blur radius (texels)
     dofStart: 0.45,           // where the blur begins (0 = center, 1 = corner)
-    grassDensity: 1400,       // patch subdivisions per axis (higher = denser)
+    // Density is the dominant cost: 1400² ≈ 2M blades (~6M verts, ~94 MB buffer)
+    // which low-memory mobile GPUs may fail to allocate, dropping the whole mesh.
+    grassDensity: isTouchDevice ? 700 : 1400, // patch subdivisions per axis
     grassHeight: 0.26,        // blade height (scene is small-scale)
     grassWidth: 0.04,         // blade base half-width
     grassColorBase: '#342b4a',// shaded blade base
@@ -58,9 +64,15 @@ const camera = new THREE.PerspectiveCamera(
 );
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-// Floor the pixel ratio at 2 — supersamples on low-DPI displays to keep edges
-// crisp (heavier fragment work, but reduces aliasing/stepping).
-renderer.setPixelRatio(Math.max(window.devicePixelRatio, 2));
+// Desktop: floor the pixel ratio at 2 to supersample low-DPI displays for crisp
+// edges. Touch devices already ship high-DPI screens, so cap (not floor) their
+// ratio at 2 — forcing a 3× phone through the HDR composer is a fill-rate killer
+// that can starve heavy draws like the grass.
+renderer.setPixelRatio(
+    isTouchDevice
+        ? Math.min(window.devicePixelRatio, 2)
+        : Math.max(window.devicePixelRatio, 2)
+);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
@@ -606,6 +618,9 @@ const grassGeometry = buildGrassGeometry(params.grassDensity);
 const grassWindAngle = Math.PI * 0.6;
 const grassMaterial = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
+    // Blades are flat billboards — show both faces so they can never be culled
+    // away depending on the viewing direction.
+    side: THREE.DoubleSide,
     uniforms: {
         uCenter: { value: new THREE.Vector2() },
         uSize: { value: GRASS_SIZE },
