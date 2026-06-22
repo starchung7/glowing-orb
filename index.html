@@ -12,6 +12,7 @@
         canvas { display: block; }
         #idle-hint {
             position: absolute;
+            z-index: 1100;
             bottom: 36px;
             left: 50%;
             transform: translateX(-50%);
@@ -30,6 +31,7 @@
         }
         #name-label {
             position: absolute;
+            z-index: 1100;
             top: 24px;
             left: 28px;
             color: #fff;
@@ -74,6 +76,16 @@
         #idle-hint .key-left  { grid-column: 1; grid-row: 2; }
         #idle-hint .key-down  { grid-column: 2; grid-row: 2; }
         #idle-hint .key-right { grid-column: 3; grid-row: 2; }
+        /* Fullscreen fog veil for the world-boundary respawn. Opacity is driven
+           from JS each frame; background colour is synced to the scene fog. */
+        #fog-veil {
+            position: absolute;
+            inset: 0;
+            background: #8a8aff;
+            opacity: 0;
+            pointer-events: none;
+            z-index: 10;
+        }
         /* Touch hint shown only on touch-primary (mobile/tablet) devices. */
         #idle-hint .hint-touch { display: none; }
         @media (pointer: coarse) {
@@ -95,6 +107,7 @@
         <div class="hint-text hint-desktop">Use the arrow keys to explore</div>
         <div class="hint-text hint-touch">Drag to explore</div>
     </div>
+    <div id="fog-veil"></div>
     <script type="module" src="/script.js"></script>
 </body>
 </html>
