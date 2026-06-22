@@ -47,6 +47,14 @@ const params = {
     grassColorTip: '#615c7a', // lit blade tip
     grassWindStrength: 0.4,   // sway amplitude
     grassLightRange: 2.0,     // how far the orb glow reaches the grass
+    // World boundary: roam too far from spawn and a thick fog rolls in and
+    // whisks you back. Radial (distance from spawn), not tied to the plane edges.
+    boundaryEnabled: true,
+    boundaryRadius: 32,        // distance from spawn that triggers the respawn
+    boundaryWarnRadius: 24,    // distance where the warning haze starts creeping in
+    boundaryWarnOpacity: 0.35, // peak haze opacity in the warning zone
+    respawnFadeOut: 0.6,       // seconds to fade to a full white-out
+    respawnFadeIn: 0.9,        // seconds to fade back in after respawning
 };
 
 const scene = new THREE.Scene();
@@ -214,6 +222,7 @@ orb.add(orbLight);
 // Hover + bobbing — the orb floats above the floor and drifts with sine noise
 const HOVER_HEIGHT = 0.3;
 const targetPos = new THREE.Vector3(0, HOVER_HEIGHT, 0);
+const SPAWN = targetPos.clone(); // original spawn point for the boundary respawn
 
 // Physics — kinematic orb pushes dynamic boxes via Rapier
 const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
@@ -962,6 +971,14 @@ particleFolder.add(particleMaterial.uniforms.uSizeScale, 'value', 1, 20, 0.5).na
 particleFolder.addColor(params, 'particleLightColor').name('light color')
     .onChange((v) => particleMaterial.uniforms.uLightColor.value.set(v));
 
+const boundaryFolder = gui.addFolder('Boundary');
+boundaryFolder.add(params, 'boundaryEnabled').name('enabled');
+boundaryFolder.add(params, 'boundaryRadius', 8, 40, 1).name('respawn radius');
+boundaryFolder.add(params, 'boundaryWarnRadius', 0, 40, 1).name('warn radius');
+boundaryFolder.add(params, 'boundaryWarnOpacity', 0, 1, 0.05).name('warn haze');
+boundaryFolder.add(params, 'respawnFadeOut', 0.1, 2, 0.1).name('fade out (s)');
+boundaryFolder.add(params, 'respawnFadeIn', 0.1, 2, 0.1).name('fade in (s)');
+
 const boxFolder = gui.addFolder('Boxes');
 boxFolder.addColor(params, 'boxColor').name('color')
     .onChange((v) => boxMat.color.set(v));
@@ -1005,6 +1022,78 @@ dofFolder.add(params, 'dofStart', 0, 1, 0.01).name('blur start').onChange((v) =>
 });
 
 gui.close(); // start collapsed
+
+// --- World boundary: thick-fog respawn ---
+// A small state machine drives a fullscreen veil (matched to the fog colour):
+// 'idle' shows a soft warning haze near the edge, 'out' fades to a full white-out
+// then teleports to spawn, 'in' fades back. An overlay is used instead of cranking
+// scene.fog so the close-up orb/trail are reliably hidden during the swap.
+const fogVeil = document.getElementById('fog-veil');
+let respawnState = 'idle'; // 'idle' | 'out' | 'in'
+let respawnTimer = 0;
+let veilOpacity = 0;
+const _spawnDist = new THREE.Vector2();
+
+function respawnToSpawn() {
+    targetPos.copy(SPAWN);
+    velocity.set(0, 0, 0);
+    velocityY = 0;
+    jumpThrustTime = 0;
+    // Hard-set the kinematic body so the teleport doesn't infer a huge velocity
+    // (which would otherwise fling nearby boxes across the scene).
+    orbBody.setTranslation({ x: SPAWN.x, y: SPAWN.y, z: SPAWN.z }, true);
+    // Clear the trail so it doesn't streak from the old location to spawn.
+    trailPoints.length = 0;
+    lastTrailPos.copy(SPAWN);
+    trailMesh.visible = false;
+}
+
+function smoothstep01(t) {
+    const c = Math.min(1, Math.max(0, t));
+    return c * c * (3 - 2 * c);
+}
+
+function updateBoundary(dt) {
+    _spawnDist.set(targetPos.x - SPAWN.x, targetPos.z - SPAWN.z);
+    const dist = _spawnDist.length();
+
+    if (respawnState === 'idle') {
+        if (params.boundaryEnabled && dist >= params.boundaryRadius) {
+            respawnState = 'out';
+            respawnTimer = 0;
+            // Match the veil to the live fog colour the moment the fade begins.
+            if (fogVeil) fogVeil.style.backgroundColor = '#' + scene.fog.color.getHexString();
+        } else {
+            // Warning haze ramps up between warn radius and respawn radius.
+            const span = params.boundaryRadius - params.boundaryWarnRadius;
+            const t = span > 0 ? (dist - params.boundaryWarnRadius) / span : 0;
+            veilOpacity = smoothstep01(t) * params.boundaryWarnOpacity;
+        }
+    }
+
+    if (respawnState === 'out') {
+        respawnTimer += dt;
+        const t = respawnTimer / Math.max(1e-4, params.respawnFadeOut);
+        veilOpacity = params.boundaryWarnOpacity +
+            (1 - params.boundaryWarnOpacity) * Math.min(1, t);
+        if (t >= 1) {
+            veilOpacity = 1;
+            respawnToSpawn();
+            respawnState = 'in';
+            respawnTimer = 0;
+        }
+    } else if (respawnState === 'in') {
+        respawnTimer += dt;
+        const t = respawnTimer / Math.max(1e-4, params.respawnFadeIn);
+        veilOpacity = 1 - Math.min(1, t);
+        if (t >= 1) {
+            veilOpacity = 0;
+            respawnState = 'idle';
+        }
+    }
+
+    if (fogVeil) fogVeil.style.opacity = veilOpacity.toFixed(3);
+}
 
 function animate() {
     const dt = Math.min(clock.getDelta(), 0.05);
@@ -1056,6 +1145,10 @@ function animate() {
         targetPos.y = HOVER_HEIGHT;
         velocityY = 0;
     }
+
+    // World boundary: may teleport targetPos back to spawn, so run it before the
+    // orb/camera positions are derived from targetPos below.
+    updateBoundary(dt);
 
     // Bobbing is more intense when idle; scales down when moving at speed
     const speed = Math.hypot(velocity.x, velocity.z);
