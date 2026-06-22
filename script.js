@@ -9,6 +9,10 @@ import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 
 await RAPIER.init();
 
+// Touch devices (phones/tablets) tend to have far less GPU memory and fill rate,
+// so we lighten the heaviest work (grass vertex count + pixel ratio) for them.
+const isTouchDevice = window.matchMedia('(pointer: coarse)').matches;
+
 // Live-tunable parameters, exposed through the lil-gui panel below.
 const params = {
     orbRadius: 0.008,
@@ -34,6 +38,15 @@ const params = {
     fogDensity: 0.086,
     dofBlur: 2.5,             // max edge blur radius (texels)
     dofStart: 0.45,           // where the blur begins (0 = center, 1 = corner)
+    // Density is the dominant cost: 1400² ≈ 2M blades (~6M verts, ~94 MB buffer)
+    // which low-memory mobile GPUs may fail to allocate, dropping the whole mesh.
+    grassDensity: isTouchDevice ? 700 : 1400, // patch subdivisions per axis
+    grassHeight: 0.26,        // blade height (scene is small-scale)
+    grassWidth: 0.04,         // blade base half-width
+    grassColorBase: '#342b4a',// shaded blade base
+    grassColorTip: '#615c7a', // lit blade tip
+    grassWindStrength: 0.4,   // sway amplitude
+    grassLightRange: 2.0,     // how far the orb glow reaches the grass
 };
 
 const scene = new THREE.Scene();
@@ -51,9 +64,15 @@ const camera = new THREE.PerspectiveCamera(
 );
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-// Floor the pixel ratio at 2 — supersamples on low-DPI displays to keep edges
-// crisp (heavier fragment work, but reduces aliasing/stepping).
-renderer.setPixelRatio(Math.max(window.devicePixelRatio, 2));
+// Desktop: floor the pixel ratio at 2 to supersample low-DPI displays for crisp
+// edges. Touch devices already ship high-DPI screens, so cap (not floor) their
+// ratio at 2 — forcing a 3× phone through the HDR composer is a fill-rate killer
+// that can starve heavy draws like the grass.
+renderer.setPixelRatio(
+    isTouchDevice
+        ? Math.min(window.devicePixelRatio, 2)
+        : Math.max(window.devicePixelRatio, 2)
+);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
@@ -165,15 +184,14 @@ function syncComposerSize() {
 }
 syncComposerSize();
 
-// Glossy black floor. Uses the lighter MeshStandardMaterial (no clearcoat lobe)
-// since the floor fills the screen and is the heaviest fragment shader; low
-// roughness keeps a subtle sheen. Dithering breaks up colour banding
-// ("stepping") in the dark floor-to-fog gradient that 8-bit output would quantize.
+// Matte black floor. Fully rough/non-metallic so it has no specular sheen or
+// reflections. Dithering breaks up colour banding ("stepping") in the dark
+// floor-to-fog gradient that 8-bit output would otherwise quantize.
 const floor = new THREE.Mesh(
     new THREE.PlaneGeometry(80, 80),
     new THREE.MeshStandardMaterial({
         color: 0x050505,
-        roughness: 0.2,
+        roughness: 1.0,
         metalness: 0.0,
         dithering: true,
     })
@@ -499,6 +517,268 @@ const particles = new THREE.Points(particleGeo, particleMaterial);
 particles.frustumCulled = false;
 scene.add(particles);
 
+// ----------------------------------------------------------------------------
+// Grass — one static non-indexed mesh whose triangles become camera-facing
+// blades in the vertex shader. A 2D ground centre is stored per blade; a mod()
+// wrap around a per-frame centre uniform tiles a finite patch infinitely so the
+// field follows the orb and looks endless with a constant blade count.
+// Ported from the WebGPU/TSL guide to WebGL2 GLSL (RawShaderMaterial, GLSL3).
+// ----------------------------------------------------------------------------
+
+// Tileable fractal value-noise texture (single channel, RepeatWrapping) used for
+// both broad height variation and the scrolling wind. Generated once on the CPU.
+function makeNoiseTexture(size = 256, basePeriod = 8) {
+    const hash = (ix, iz, period) => {
+        ix = ((ix % period) + period) % period;
+        iz = ((iz % period) + period) % period;
+        let h = (ix * 374761393 + iz * 668265263) | 0;
+        h = (h ^ (h >> 13)) * 1274126177;
+        h = h ^ (h >> 16);
+        return ((h >>> 0) / 4294967295);
+    };
+    const valueNoise = (x, z, period) => {
+        const x0 = Math.floor(x), z0 = Math.floor(z);
+        const fx = x - x0, fz = z - z0;
+        const sx = fx * fx * (3 - 2 * fx), sz = fz * fz * (3 - 2 * fz);
+        const v00 = hash(x0, z0, period), v10 = hash(x0 + 1, z0, period);
+        const v01 = hash(x0, z0 + 1, period), v11 = hash(x0 + 1, z0 + 1, period);
+        const a = v00 + (v10 - v00) * sx;
+        const b = v01 + (v11 - v01) * sx;
+        return a + (b - a) * sz;
+    };
+    // Single channel: only the red channel is ever sampled, so a 1-byte/texel
+    // R8 texture uses a quarter of the memory of RGBA for the same result.
+    const data = new Uint8Array(size * size);
+    for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+            const u = x / size, v = y / size;
+            // Sum octaves; each octave's lattice period scales with frequency so
+            // the result still tiles seamlessly across the texture edges.
+            let amp = 0.5, sum = 0, norm = 0;
+            for (let o = 0; o < 4; o++) {
+                const period = basePeriod * (1 << o);
+                sum += valueNoise(u * period, v * period, period) * amp;
+                norm += amp;
+                amp *= 0.5;
+            }
+            const n = Math.max(0, Math.min(1, sum / norm));
+            data[y * size + x] = Math.round(n * 255);
+        }
+    }
+    const tex = new THREE.DataTexture(data, size, size, THREE.RedFormat);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.needsUpdate = true;
+    return tex;
+}
+const grassNoise = makeNoiseTexture();
+
+const GRASS_RADIUS = 24;              // patch half-extent (fog hides the boundary)
+const GRASS_SIZE = GRASS_RADIUS * 2;
+
+// Build the non-indexed blade geometry for a given subdivision count (density).
+// 3 verts per blade: 'position' (itemSize 2) holds the blade's ground centre,
+// repeated per vertex; aCorner tags tip(0)/left(1)/right(2). Blades are placed
+// on the GPU, so the tiny bounding sphere + frustumCulled=false keep Three from
+// wrongly culling the mesh.
+function buildGrassGeometry(subdivisions) {
+    const count = subdivisions * subdivisions;
+    const cell = GRASS_SIZE / subdivisions;
+    const ground = new Float32Array(count * 3 * 2);
+    const corner = new Float32Array(count * 3);
+    const heightRand = new Float32Array(count * 3);
+    let v = 0;
+    for (let iX = 0; iX < subdivisions; iX++) {
+        const cellX = (iX / subdivisions - 0.5) * GRASS_SIZE + cell * 0.5;
+        for (let iZ = 0; iZ < subdivisions; iZ++) {
+            const cellZ = (iZ / subdivisions - 0.5) * GRASS_SIZE + cell * 0.5;
+            const px = cellX + (Math.random() - 0.5) * cell;
+            const pz = cellZ + (Math.random() - 0.5) * cell;
+            const hr = Math.random();
+            for (let c = 0; c < 3; c++) {
+                ground[v * 2] = px;
+                ground[v * 2 + 1] = pz;
+                corner[v] = c;
+                heightRand[v] = hr;
+                v++;
+            }
+        }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(ground, 2));
+    geo.setAttribute('aCorner', new THREE.BufferAttribute(corner, 1));
+    geo.setAttribute('aHeightRand', new THREE.BufferAttribute(heightRand, 1));
+    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1);
+    return geo;
+}
+const grassGeometry = buildGrassGeometry(params.grassDensity);
+
+const grassWindAngle = Math.PI * 0.6;
+const grassMaterial = new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    // Blades are flat billboards — show both faces so they can never be culled
+    // away depending on the viewing direction.
+    side: THREE.DoubleSide,
+    uniforms: {
+        uCenter: { value: new THREE.Vector2() },
+        uSize: { value: GRASS_SIZE },
+        uTime: { value: 0 },
+        uNoise: { value: grassNoise },
+        uBladeWidth: { value: params.grassWidth },
+        uBladeHeight: { value: params.grassHeight },
+        uHeightRand: { value: 0.6 },
+        uHeightNoiseScale: { value: 0.06 },
+        uWindDir: { value: new THREE.Vector2(Math.sin(grassWindAngle), Math.cos(grassWindAngle)) },
+        uWindStrength: { value: params.grassWindStrength },
+        uWindFreq: { value: 0.5 },
+        uViewDir: { value: new THREE.Vector2(0, -1) },
+        uColorBase: { value: new THREE.Color(params.grassColorBase) },
+        uColorTip: { value: new THREE.Color(params.grassColorTip) },
+        uAmbient: { value: new THREE.Color(0x4a5570) },
+        uOrbPos: { value: new THREE.Vector3() },
+        uOrbColor: { value: new THREE.Color(params.orbLightColor) },
+        uOrbIntensity: { value: params.orbLightIntensity },
+        uOrbRange: { value: params.grassLightRange },
+        uFogColor: { value: new THREE.Color(params.fogColor) },
+        uFogDensity: { value: params.fogDensity },
+    },
+    vertexShader: /* glsl */ `
+        precision highp float;
+        uniform mat4 projectionMatrix;
+        uniform mat4 modelViewMatrix;
+        uniform mat4 modelMatrix;
+        uniform vec3 cameraPosition;
+
+        in vec2 position;       // blade ground centre (xz)
+        in float aCorner;       // 0 = tip, 1 = left, 2 = right
+        in float aHeightRand;
+
+        uniform vec2 uCenter;
+        uniform float uSize;
+        uniform float uTime;
+        uniform sampler2D uNoise;
+        uniform float uBladeWidth;
+        uniform float uBladeHeight;
+        uniform float uHeightRand;
+        uniform float uHeightNoiseScale;
+        uniform vec2 uWindDir;
+        uniform float uWindStrength;
+        uniform float uWindFreq;
+        uniform vec2 uViewDir;      // camera's horizontal forward direction
+
+        out float vTip;
+        out vec3 vWorldPos;
+        out float vFogDist;
+
+        vec2 windOffset(vec2 p) {
+            vec2 rp = p * uWindFreq;
+            float n1 = texture(uNoise, rp * 0.2 + uWindDir * uTime).r - 0.5;
+            float n2 = texture(uNoise, rp * 0.1 + uWindDir * (uTime * 0.2)).r - 0.5;
+            return uWindDir * (n1 + n2) * uWindStrength;
+        }
+
+        void main() {
+            // Local blade triangle corner: tip (0,1), left (1,0), right (-1,0).
+            vec2 shape;
+            if (aCorner < 0.5)      shape = vec2(0.0, 1.0);
+            else if (aCorner < 1.5) shape = vec2(1.0, 0.0);
+            else                    shape = vec2(-1.0, 0.0);
+            float tip = step(aCorner, 0.5);
+
+            // Infinite tiling: wrap the blade into the patch window around centre.
+            float halfSize = uSize * 0.5;
+            vec2 loop = position - uCenter;
+            loop.x = mod(loop.x + halfSize, uSize) - halfSize;
+            loop.y = mod(loop.y + halfSize, uSize) - halfSize;
+            vec3 ground = vec3(loop.x + uCenter.x, 0.0, loop.y + uCenter.y);
+
+            vec4 worldBase = modelMatrix * vec4(ground, 1.0);
+            vec2 bladeXZ = worldBase.xz;
+
+            // Height + wind only move the tip vertex — the two base corners stay
+            // flat on the ground (shape.y = 0) and don't sway. So gate their noise
+            // texture fetches behind the tip test and skip them for ~2/3 of verts.
+            float height = 0.0;
+            if (tip > 0.5) {
+                float hn = texture(uNoise, bladeXZ * uHeightNoiseScale).r + 0.5;
+                height = uBladeHeight *
+                    (uHeightRand * aHeightRand + (1.0 - uHeightRand)) * hn;
+            }
+
+            vec3 vertPos = ground + vec3(shape.x * uBladeWidth, shape.y * height, 0.0);
+
+            // View-aligned billboard: orient every blade's flat face perpendicular
+            // to the camera's viewing DIRECTION (not its position). Since all blades
+            // share the same view direction, they don't swivel as the camera moves
+            // around — they only re-orient if the camera actually rotates.
+            float ang = atan(uViewDir.y, uViewDir.x) - 1.5707963;
+            vec2 d = vertPos.xz - ground.xz;
+            float ca = cos(ang), sa = sin(ang);
+            vertPos.xz = ground.xz + vec2(ca * d.x - sa * d.y, sa * d.x + ca * d.y);
+
+            // Wind sways the tip only, scaled by height (base verts skipped above).
+            if (tip > 0.5) {
+                vec2 wind = windOffset(bladeXZ) * height * 2.0;
+                vertPos.x += wind.x;
+                vertPos.z += wind.y;
+            }
+
+            vec4 world = modelMatrix * vec4(vertPos, 1.0);
+            vWorldPos = world.xyz;
+            vTip = tip;
+            vFogDist = distance(world.xyz, cameraPosition);
+
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(vertPos, 1.0);
+        }
+    `,
+    fragmentShader: /* glsl */ `
+        precision highp float;
+
+        in float vTip;
+        in vec3 vWorldPos;
+        in float vFogDist;
+        out vec4 fragColor;
+
+        uniform vec3 uColorBase;
+        uniform vec3 uColorTip;
+        uniform vec3 uAmbient;
+        uniform vec3 uOrbPos;
+        uniform vec3 uOrbColor;
+        uniform float uOrbIntensity;
+        uniform float uOrbRange;
+        uniform vec3 uFogColor;
+        uniform float uFogDensity;
+
+        void main() {
+            // Base-darkening AO: dark at the root, full bright at the tip.
+            float ao = mix(0.4, 1.0, vTip);
+            vec3 albedo = mix(uColorBase, uColorTip, vTip) * ao;
+
+            // Flat up-normal lighting (blades lit like the ground, per the guide)
+            // plus the orb's travelling glow as a local point light.
+            vec3 N = vec3(0.0, 1.0, 0.0);
+            vec3 toLight = uOrbPos - vWorldPos;
+            float dist = length(toLight);
+            float atten = pow(clamp(1.0 - dist / uOrbRange, 0.0, 1.0), 2.0);
+            float ndl = max(dot(N, normalize(toLight)), 0.0);
+            vec3 lit = uAmbient + uOrbColor * uOrbIntensity * atten * (0.4 + 0.6 * ndl);
+            vec3 col = albedo * lit;
+
+            // Exponential-squared fog to match scene.fog (FogExp2).
+            float f = 1.0 - exp(-pow(uFogDensity * vFogDist, 2.0));
+            col = mix(col, uFogColor, clamp(f, 0.0, 1.0));
+
+            fragColor = vec4(col, 1.0);
+        }
+    `,
+});
+
+const grass = new THREE.Mesh(grassGeometry, grassMaterial);
+grass.frustumCulled = false;
+scene.add(grass);
+
 // 3/4 view: above the orb, tilted forward
 const cameraOffset = new THREE.Vector3(0, 1.8, 1.8);
 
@@ -634,6 +914,8 @@ window.addEventListener('resize', () => {
 });
 
 const clock = new THREE.Clock();
+let grassWindTime = 0; // accumulated wind "localTime" (scaled by strength)
+const _grassCamDir = new THREE.Vector3(); // scratch for camera forward direction
 const moveDir = new THREE.Vector3();
 const velocity = new THREE.Vector3();
 const targetVelocity = new THREE.Vector3();
@@ -691,6 +973,26 @@ fogFolder.addColor(params, 'fogColor').name('sky / fog').onChange((v) => {
 });
 fogFolder.add(params, 'fogDensity', 0, 0.15, 0.002).name('fog density')
     .onChange((v) => { scene.fog.density = v; });
+
+const grassFolder = gui.addFolder('Grass');
+// Density rebuilds the geometry, so only do it when the slider is released.
+grassFolder.add(params, 'grassDensity', 120, 1400, 20).name('density')
+    .onFinishChange((v) => {
+        grass.geometry.dispose();
+        grass.geometry = buildGrassGeometry(v);
+    });
+grassFolder.add(params, 'grassHeight', 0.05, 0.6, 0.01).name('height')
+    .onChange((v) => { grassMaterial.uniforms.uBladeHeight.value = v; });
+grassFolder.add(params, 'grassWidth', 0.005, 0.1, 0.005).name('width')
+    .onChange((v) => { grassMaterial.uniforms.uBladeWidth.value = v; });
+grassFolder.add(params, 'grassWindStrength', 0, 1.5, 0.05).name('wind')
+    .onChange((v) => { grassMaterial.uniforms.uWindStrength.value = v; });
+grassFolder.add(params, 'grassLightRange', 1, 12, 0.5).name('glow range')
+    .onChange((v) => { grassMaterial.uniforms.uOrbRange.value = v; });
+grassFolder.addColor(params, 'grassColorBase').name('base color')
+    .onChange((v) => grassMaterial.uniforms.uColorBase.value.set(v));
+grassFolder.addColor(params, 'grassColorTip').name('tip color')
+    .onChange((v) => grassMaterial.uniforms.uColorTip.value.set(v));
 
 const dofFolder = gui.addFolder('Depth of Field');
 dofFolder.add(params, 'dofBlur', 0, 8, 0.1).name('edge blur').onChange((v) => {
@@ -791,6 +1093,24 @@ function animate() {
     // Drive the particle field's light reaction from the live orb position.
     particleMaterial.uniforms.uTime.value = clock.elapsedTime;
     particleMaterial.uniforms.uOrbPos.value.copy(orb.position);
+
+    // Grass: re-centre the infinite patch under the orb, advance wind, and sync
+    // the orb glow + fog so the field matches the rest of the scene.
+    const gu = grassMaterial.uniforms;
+    gu.uCenter.value.set(targetPos.x, targetPos.z);
+    // View-aligned billboard direction: the camera's horizontal forward. Constant
+    // here (fixed 3/4 view), but synced each frame so it stays correct if it moves.
+    camera.getWorldDirection(_grassCamDir);
+    if (Math.abs(_grassCamDir.x) > 1e-6 || Math.abs(_grassCamDir.z) > 1e-6) {
+        gu.uViewDir.value.set(_grassCamDir.x, _grassCamDir.z).normalize();
+    }
+    grassWindTime += dt * 0.1 * gu.uWindStrength.value; // localTime accumulation
+    gu.uTime.value = grassWindTime;
+    gu.uOrbPos.value.copy(orb.position);
+    gu.uOrbColor.value.copy(orbLight.color);
+    gu.uOrbIntensity.value = orbLight.intensity;
+    gu.uFogColor.value.copy(scene.fog.color);
+    gu.uFogDensity.value = scene.fog.density;
 
     // Drive the orb's kinematic body from targetPos (un-bobbed, so contacts
     // stay stable) — Rapier infers velocity from successive translations.
