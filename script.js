@@ -53,8 +53,8 @@ const params = {
     boundaryRadius: 32,        // distance from spawn that triggers the respawn
     boundaryWarnRadius: 24,    // distance where the warning haze starts creeping in
     boundaryWarnOpacity: 0.35, // peak haze opacity in the warning zone
-    respawnFadeOut: 0.6,       // seconds to fade to a full white-out
-    respawnFadeIn: 0.9,        // seconds to fade back in after respawning
+    respawnFadeOut: 0.8,       // seconds to fade to a full white-out
+    respawnFadeIn: 1.2,        // seconds to fade back in after respawning
 };
 
 const scene = new THREE.Scene();
@@ -1032,6 +1032,7 @@ const fogVeil = document.getElementById('fog-veil');
 let respawnState = 'idle'; // 'idle' | 'out' | 'in'
 let respawnTimer = 0;
 let veilOpacity = 0;
+let veilApplied = -1; // last opacity actually written to the DOM (-1 = never)
 const _spawnDist = new THREE.Vector2();
 
 function respawnToSpawn() {
@@ -1092,7 +1093,13 @@ function updateBoundary(dt) {
         }
     }
 
-    if (fogVeil) fogVeil.style.opacity = veilOpacity.toFixed(3);
+    // Only touch the DOM when the opacity actually changes — when idle and away
+    // from the edge it stays a constant 0, so this skips a per-frame style write
+    // and string allocation for nearly all of playtime.
+    if (fogVeil && veilOpacity !== veilApplied) {
+        fogVeil.style.opacity = veilOpacity === 0 ? '0' : veilOpacity.toFixed(3);
+        veilApplied = veilOpacity;
+    }
 }
 
 function animate() {
