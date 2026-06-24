@@ -6,6 +6,8 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import treeUrl from './assets/models/tree1.glb?url';
 
 await RAPIER.init();
 
@@ -47,6 +49,11 @@ const params = {
     grassColorTip: '#615c7a', // lit blade tip
     grassWindStrength: 0.4,   // sway amplitude
     grassLightRange: 2.0,     // how far the orb glow reaches the grass
+    // Scattered trees — one InstancedMesh per source sub-mesh (lightweight).
+    treeCount: 60,            // number of scattered trees
+    treeHeight: 2.5,          // target world height the model is normalised to
+    treeAreaRadius: 30,       // trees scatter within this radius of spawn
+    treeClearing: 4,          // keep a clear circle around spawn (no trees)
     // World boundary: roam too far from spawn and a thick fog rolls in and
     // whisks you back. Radial (distance from spawn), not tied to the plane edges.
     boundaryEnabled: true,
@@ -788,6 +795,103 @@ const grass = new THREE.Mesh(grassGeometry, grassMaterial);
 grass.frustumCulled = false;
 scene.add(grass);
 
+// ----------------------------------------------------------------------------
+// Scattered trees — the tree1.glb model instanced across the explorable area.
+// Drawing N copies of the model as one InstancedMesh per sub-mesh costs only a
+// handful of draw calls regardless of how many trees there are, so it stays
+// cheap even with dense scattering. The model is auto-normalised from its own
+// bounding box, so it lands at a sensible size no matter how it was authored.
+// ----------------------------------------------------------------------------
+const treeGroup = new THREE.Group();
+scene.add(treeGroup);
+
+// Captured once the GLB loads: each source mesh + its baked transform within the
+// model, the model's base (normalised) scale, and the lift that grounds it.
+let treeSources = null;
+let treeModelHeight = 1; // the model's natural (unscaled) height
+let treeBaseScale = 1;
+let treeBaseMinY = 0;
+
+// Reused scratch objects so a rebuild allocates nothing per instance.
+const _treePos = new THREE.Vector3();
+const _treeQuat = new THREE.Quaternion();
+const _treeScale = new THREE.Vector3();
+const _treeUp = new THREE.Vector3(0, 1, 0);
+const _treeInstance = new THREE.Matrix4();
+const _treeFinal = new THREE.Matrix4();
+
+function buildTrees() {
+    // Clear any previous instanced meshes (e.g. after a GUI count change).
+    for (let i = treeGroup.children.length - 1; i >= 0; i--) {
+        const child = treeGroup.children[i];
+        child.geometry.dispose();
+        treeGroup.remove(child);
+    }
+    if (!treeSources) return;
+
+    const count = Math.max(0, Math.floor(params.treeCount));
+
+    // Per-instance ground transforms (position + Y rotation + scale variation),
+    // shared across every sub-mesh so trunk and foliage stay aligned.
+    const instances = [];
+    for (let i = 0; i < count; i++) {
+        // Uniform-ish disk sampling in an annulus between the clearing and the
+        // outer radius, so spawn stays open and no tree lands on the orb.
+        const rMin = params.treeClearing;
+        const rMax = params.treeAreaRadius;
+        const r = Math.sqrt(rMin * rMin + Math.random() * (rMax * rMax - rMin * rMin));
+        const a = Math.random() * Math.PI * 2;
+        const x = Math.cos(a) * r;
+        const z = Math.sin(a) * r;
+        const variation = 0.8 + Math.random() * 0.5; // 0.8x – 1.3x size spread
+        const s = treeBaseScale * variation;
+
+        _treePos.set(x, -treeBaseMinY * s, z); // lift so the base sits on y = 0
+        _treeQuat.setFromAxisAngle(_treeUp, Math.random() * Math.PI * 2);
+        _treeScale.setScalar(s);
+        instances.push(new THREE.Matrix4().compose(_treePos, _treeQuat, _treeScale));
+    }
+
+    // One InstancedMesh per source sub-mesh; bake the sub-mesh's transform inside
+    // the model so multi-part trees (trunk + leaves) reconstruct correctly.
+    for (const { geometry, material, matrix } of treeSources) {
+        const inst = new THREE.InstancedMesh(geometry, material, count);
+        inst.frustumCulled = false; // instances span the whole area; skip culling
+        for (let i = 0; i < count; i++) {
+            _treeFinal.multiplyMatrices(instances[i], matrix);
+            inst.setMatrixAt(i, _treeFinal);
+        }
+        inst.instanceMatrix.needsUpdate = true;
+        treeGroup.add(inst);
+    }
+}
+
+new GLTFLoader().load(treeUrl, (gltf) => {
+    gltf.scene.updateMatrixWorld(true);
+
+    // Normalise size from the model's own bounds so it sits at treeHeight units.
+    const box = new THREE.Box3().setFromObject(gltf.scene);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    treeModelHeight = size.y > 1e-5 ? size.y : 1;
+    treeBaseScale = params.treeHeight / treeModelHeight;
+    treeBaseMinY = box.min.y;
+
+    // Collect every mesh with its world matrix relative to the model root.
+    treeSources = [];
+    gltf.scene.traverse((obj) => {
+        if (obj.isMesh) {
+            treeSources.push({
+                geometry: obj.geometry,
+                material: obj.material,
+                matrix: obj.matrixWorld.clone(),
+            });
+        }
+    });
+
+    buildTrees();
+});
+
 // 3/4 view: above the orb, tilted forward
 const cameraOffset = new THREE.Vector3(0, 1.8, 1.8);
 
@@ -1010,6 +1114,20 @@ grassFolder.addColor(params, 'grassColorBase').name('base color')
     .onChange((v) => grassMaterial.uniforms.uColorBase.value.set(v));
 grassFolder.addColor(params, 'grassColorTip').name('tip color')
     .onChange((v) => grassMaterial.uniforms.uColorTip.value.set(v));
+
+const treeFolder = gui.addFolder('Trees');
+// Each of these reshuffles the scatter, so rebuild only when the slider settles.
+treeFolder.add(params, 'treeCount', 0, 300, 1).name('count')
+    .onFinishChange(buildTrees);
+treeFolder.add(params, 'treeHeight', 0.5, 8, 0.1).name('height')
+    .onFinishChange(() => {
+        treeBaseScale = params.treeHeight / treeModelHeight;
+        buildTrees();
+    });
+treeFolder.add(params, 'treeAreaRadius', 5, 40, 1).name('area radius')
+    .onFinishChange(buildTrees);
+treeFolder.add(params, 'treeClearing', 0, 20, 0.5).name('clearing')
+    .onFinishChange(buildTrees);
 
 const dofFolder = gui.addFolder('Depth of Field');
 dofFolder.add(params, 'dofBlur', 0, 8, 0.1).name('edge blur').onChange((v) => {
