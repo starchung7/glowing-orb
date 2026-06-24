@@ -8,8 +8,128 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import treeUrl from './assets/models/tree1.glb?url';
+import terrainUrl from './assets/models/terrain.glb?url';
 
 await RAPIER.init();
+
+// ----------------------------------------------------------------------------
+// Terrain — the rolling ground from terrain.glb. Loaded up-front so the rest of
+// the scene (orb hover, physics, grass, trees) can conform to its surface.
+// A heightmap is baked once by ray-casting straight down over a regular grid,
+// giving a fast topology-agnostic `terrainHeightAt(x, z)` lookup, a float
+// height texture for the grass shader, and a trimesh for the physics collider.
+// ----------------------------------------------------------------------------
+const _terrainGltf = await new GLTFLoader().loadAsync(terrainUrl);
+_terrainGltf.scene.updateMatrixWorld(true);
+
+// The file also contains a stray default "Cube"; the ground itself is "Grid".
+let terrainMesh = null;
+_terrainGltf.scene.traverse((o) => {
+    if (o.isMesh && o.name === 'Grid') terrainMesh = o;
+});
+if (!terrainMesh) {
+    // Fall back to the largest mesh if the export naming ever changes.
+    let maxCount = -1;
+    _terrainGltf.scene.traverse((o) => {
+        const c = o.isMesh ? o.geometry.attributes.position.count : -1;
+        if (c > maxCount) { maxCount = c; terrainMesh = o; }
+    });
+}
+terrainMesh.updateMatrixWorld(true);
+terrainMesh.receiveShadow = false;
+terrainMesh.frustumCulled = false;
+
+// World-space bounds of the terrain, used to map XZ → heightmap UV.
+const _terrainBox = new THREE.Box3().setFromObject(terrainMesh);
+const TERRAIN_MIN_X = _terrainBox.min.x;
+const TERRAIN_MIN_Z = _terrainBox.min.z;
+const TERRAIN_SIZE_X = Math.max(1e-4, _terrainBox.max.x - _terrainBox.min.x);
+const TERRAIN_SIZE_Z = Math.max(1e-4, _terrainBox.max.z - _terrainBox.min.z);
+const TERRAIN_TOP = _terrainBox.max.y;
+
+// Bake the heightmap by ray-casting down onto the terrain over a regular grid.
+const HMAP_RES = 96;                 // samples per axis (one-time bake cost)
+const _heights = new Float32Array(HMAP_RES * HMAP_RES);
+{
+    const ray = new THREE.Raycaster();
+    const down = new THREE.Vector3(0, -1, 0);
+    const origin = new THREE.Vector3();
+    const rayTop = TERRAIN_TOP + 10;
+    for (let iz = 0; iz < HMAP_RES; iz++) {
+        const z = TERRAIN_MIN_Z + (iz / (HMAP_RES - 1)) * TERRAIN_SIZE_Z;
+        for (let ix = 0; ix < HMAP_RES; ix++) {
+            const x = TERRAIN_MIN_X + (ix / (HMAP_RES - 1)) * TERRAIN_SIZE_X;
+            origin.set(x, rayTop, z);
+            ray.set(origin, down);
+            const hit = ray.intersectObject(terrainMesh, false);
+            _heights[iz * HMAP_RES + ix] = hit.length ? hit[0].point.y : _terrainBox.min.y;
+        }
+    }
+}
+
+// Bilinearly sample the baked heightmap. Clamps to the terrain edge outside its
+// bounds so distant (foggy) regions stay flat rather than reading garbage.
+function terrainHeightAt(x, z) {
+    const fx = ((x - TERRAIN_MIN_X) / TERRAIN_SIZE_X) * (HMAP_RES - 1);
+    const fz = ((z - TERRAIN_MIN_Z) / TERRAIN_SIZE_Z) * (HMAP_RES - 1);
+    const cx = Math.min(HMAP_RES - 1, Math.max(0, fx));
+    const cz = Math.min(HMAP_RES - 1, Math.max(0, fz));
+    const x0 = Math.floor(cx), z0 = Math.floor(cz);
+    const x1 = Math.min(HMAP_RES - 1, x0 + 1), z1 = Math.min(HMAP_RES - 1, z0 + 1);
+    const tx = cx - x0, tz = cz - z0;
+    const h00 = _heights[z0 * HMAP_RES + x0], h10 = _heights[z0 * HMAP_RES + x1];
+    const h01 = _heights[z1 * HMAP_RES + x0], h11 = _heights[z1 * HMAP_RES + x1];
+    const a = h00 + (h10 - h00) * tx;
+    const b = h01 + (h11 - h01) * tx;
+    return a + (b - a) * tz;
+}
+
+// Height texture for the grass vertex shader. Stored as 8-bit normalized R
+// (decoded with uHeightMin/uHeightRange in the shader) so linear filtering is
+// supported everywhere — float-texture linear filtering isn't guaranteed on
+// mobile GPUs. 8 bits over the shallow terrain range is plenty for grass.
+let TERRAIN_HEIGHT_MIN = Infinity, TERRAIN_HEIGHT_MAX = -Infinity;
+for (let i = 0; i < _heights.length; i++) {
+    if (_heights[i] < TERRAIN_HEIGHT_MIN) TERRAIN_HEIGHT_MIN = _heights[i];
+    if (_heights[i] > TERRAIN_HEIGHT_MAX) TERRAIN_HEIGHT_MAX = _heights[i];
+}
+const TERRAIN_HEIGHT_RANGE = Math.max(1e-4, TERRAIN_HEIGHT_MAX - TERRAIN_HEIGHT_MIN);
+const _heightBytes = new Uint8Array(_heights.length);
+for (let i = 0; i < _heights.length; i++) {
+    _heightBytes[i] = Math.round(
+        ((_heights[i] - TERRAIN_HEIGHT_MIN) / TERRAIN_HEIGHT_RANGE) * 255,
+    );
+}
+const terrainHeightTexture = new THREE.DataTexture(
+    _heightBytes, HMAP_RES, HMAP_RES, THREE.RedFormat, THREE.UnsignedByteType,
+);
+terrainHeightTexture.minFilter = THREE.LinearFilter;
+terrainHeightTexture.magFilter = THREE.LinearFilter;
+terrainHeightTexture.wrapS = THREE.ClampToEdgeWrapping;
+terrainHeightTexture.wrapT = THREE.ClampToEdgeWrapping;
+terrainHeightTexture.needsUpdate = true;
+
+// Trimesh data for the physics ground collider (exact match to the visuals).
+function buildTerrainTrimesh(mesh) {
+    const geo = mesh.geometry;
+    const posAttr = geo.attributes.position;
+    const m = mesh.matrixWorld;
+    const v = new THREE.Vector3();
+    const vertices = new Float32Array(posAttr.count * 3);
+    for (let i = 0; i < posAttr.count; i++) {
+        v.fromBufferAttribute(posAttr, i).applyMatrix4(m);
+        vertices[i * 3] = v.x; vertices[i * 3 + 1] = v.y; vertices[i * 3 + 2] = v.z;
+    }
+    let indices;
+    if (geo.index) {
+        indices = new Uint32Array(geo.index.array);
+    } else {
+        indices = new Uint32Array(posAttr.count);
+        for (let i = 0; i < posAttr.count; i++) indices[i] = i;
+    }
+    return { vertices, indices };
+}
+const terrainTrimesh = buildTerrainTrimesh(terrainMesh);
 
 // Touch devices (phones/tablets) tend to have far less GPU memory and fill rate,
 // so we lighten the heaviest work (grass vertex count + pixel ratio) for them.
@@ -52,13 +172,13 @@ const params = {
     // Scattered trees — one InstancedMesh per source sub-mesh (lightweight).
     treeCount: 60,            // number of scattered trees
     treeHeight: 2.5,          // target world height the model is normalised to
-    treeAreaRadius: 30,       // trees scatter within this radius of spawn
+    treeAreaRadius: 21,       // trees scatter within this radius of spawn
     treeClearing: 4,          // keep a clear circle around spawn (no trees)
     // World boundary: roam too far from spawn and a thick fog rolls in and
     // whisks you back. Radial (distance from spawn), not tied to the plane edges.
     boundaryEnabled: true,
-    boundaryRadius: 32,        // distance from spawn that triggers the respawn
-    boundaryWarnRadius: 24,    // distance where the warning haze starts creeping in
+    boundaryRadius: 22,        // distance from spawn that triggers the respawn
+    boundaryWarnRadius: 16,    // distance where the warning haze starts creeping in
     boundaryWarnOpacity: 0.35, // peak haze opacity in the warning zone
     respawnFadeOut: 0.8,       // seconds to fade to a full white-out
     respawnFadeIn: 1.2,        // seconds to fade back in after respawning
@@ -199,45 +319,43 @@ function syncComposerSize() {
 }
 syncComposerSize();
 
-// Matte black floor. Fully rough/non-metallic so it has no specular sheen or
-// reflections. Dithering breaks up colour banding ("stepping") in the dark
-// floor-to-fog gradient that 8-bit output would otherwise quantize.
-const floor = new THREE.Mesh(
-    new THREE.PlaneGeometry(80, 80),
-    new THREE.MeshStandardMaterial({
-        color: 0x050505,
-        roughness: 1.0,
-        metalness: 0.0,
-        dithering: true,
-    })
-);
-floor.rotation.x = -Math.PI / 2;
-scene.add(floor);
+// Rolling terrain ground (from terrain.glb), replacing the old flat plane. The
+// mesh keeps its Blender-authored "terrain" material; enable dithering on it to
+// avoid colour banding in the dark terrain-to-fog gradient.
+terrainMesh.traverse((o) => {
+    if (o.isMesh && o.material) {
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        for (const mat of mats) mat.dithering = true;
+    }
+});
+scene.add(terrainMesh);
 
 // Tiny glowing orb — same radius as the trail tube so they sit flush
 const orb = new THREE.Mesh(
     new THREE.SphereGeometry(params.orbRadius, 24, 24),
     new THREE.MeshBasicMaterial({ color: 0xffffff })
 );
-orb.position.y = 0.3;
 scene.add(orb);
 
 // A point light at the orb to faintly illuminate the floor around it
 const orbLight = new THREE.PointLight(params.orbLightColor, params.orbLightIntensity, 2.5, 2);
 orb.add(orbLight);
 
-// Hover + bobbing — the orb floats above the floor and drifts with sine noise
+// Hover + bobbing — the orb floats a fixed gap above the terrain surface and
+// drifts with sine noise. Spawn at the origin, lifted to the local ground.
 const HOVER_HEIGHT = 0.3;
-const targetPos = new THREE.Vector3(0, HOVER_HEIGHT, 0);
+const targetPos = new THREE.Vector3(0, terrainHeightAt(0, 0) + HOVER_HEIGHT, 0);
+orb.position.copy(targetPos);
 const SPAWN = targetPos.clone(); // original spawn point for the boundary respawn
 
 // Physics — kinematic orb pushes dynamic boxes via Rapier
 const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
 
-// Ground plate: thin static cuboid with top face at y = 0
+// Ground: a static trimesh matching the terrain surface exactly, so boxes rest
+// on the real hills and valleys rather than a flat plane.
 const groundBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
 world.createCollider(
-    RAPIER.ColliderDesc.cuboid(40, 0.05, 40).setTranslation(0, -0.05, 0),
+    RAPIER.ColliderDesc.trimesh(terrainTrimesh.vertices, terrainTrimesh.indices),
     groundBody,
 );
 
@@ -280,7 +398,8 @@ for (const [x, z] of BOX_LAYOUT) {
     scene.add(mesh);
     const body = world.createRigidBody(
         RAPIER.RigidBodyDesc.dynamic()
-            .setTranslation(x, BOX_SIZE / 2, z)
+            // Spawn just above the local terrain surface so boxes settle onto it.
+            .setTranslation(x, terrainHeightAt(x, z) + BOX_SIZE / 2 + 0.05, z)
             .setLinearDamping(0.4)
             .setAngularDamping(0.6),
     );
@@ -659,6 +778,12 @@ const grassMaterial = new THREE.RawShaderMaterial({
         uOrbRange: { value: params.grassLightRange },
         uFogColor: { value: new THREE.Color(params.fogColor) },
         uFogDensity: { value: params.fogDensity },
+        // Terrain conforming: blades ride the baked height texture.
+        uHeightMap: { value: terrainHeightTexture },
+        uTerrainMin: { value: new THREE.Vector2(TERRAIN_MIN_X, TERRAIN_MIN_Z) },
+        uTerrainSize: { value: new THREE.Vector2(TERRAIN_SIZE_X, TERRAIN_SIZE_Z) },
+        uHeightMin: { value: TERRAIN_HEIGHT_MIN },
+        uHeightRange: { value: TERRAIN_HEIGHT_RANGE },
     },
     vertexShader: /* glsl */ `
         precision highp float;
@@ -683,6 +808,11 @@ const grassMaterial = new THREE.RawShaderMaterial({
         uniform float uWindStrength;
         uniform float uWindFreq;
         uniform vec2 uViewDir;      // camera's horizontal forward direction
+        uniform sampler2D uHeightMap;
+        uniform vec2 uTerrainMin;
+        uniform vec2 uTerrainSize;
+        uniform float uHeightMin;
+        uniform float uHeightRange;
 
         out float vTip;
         out vec3 vWorldPos;
@@ -712,6 +842,11 @@ const grassMaterial = new THREE.RawShaderMaterial({
 
             vec4 worldBase = modelMatrix * vec4(ground, 1.0);
             vec2 bladeXZ = worldBase.xz;
+
+            // Conform the blade to the terrain: lift its base to the sampled
+            // ground height so the whole field drapes over the hills/valleys.
+            vec2 hUV = (bladeXZ - uTerrainMin) / uTerrainSize;
+            ground.y += uHeightMin + texture(uHeightMap, hUV).r * uHeightRange;
 
             // Height + wind only move the tip vertex — the two base corners stay
             // flat on the ground (shape.y = 0) and don't sway. So gate their noise
@@ -846,7 +981,8 @@ function buildTrees() {
         const variation = 0.8 + Math.random() * 0.5; // 0.8x – 1.3x size spread
         const s = treeBaseScale * variation;
 
-        _treePos.set(x, -treeBaseMinY * s, z); // lift so the base sits on y = 0
+        // Lift so the model base sits on the terrain surface at this XZ.
+        _treePos.set(x, terrainHeightAt(x, z) - treeBaseMinY * s, z);
         _treeQuat.setFromAxisAngle(_treeUp, Math.random() * Math.PI * 2);
         _treeScale.setScalar(s);
         instances.push(new THREE.Matrix4().compose(_treePos, _treeQuat, _treeScale));
@@ -928,7 +1064,8 @@ let velocityY = 0;
 let jumpThrustTime = 0;          // remaining propulsion time
 let bobScaleSmooth = 1;          // eased bob amplitude factor (avoids snapping)
 
-const isGrounded = () => targetPos.y <= HOVER_HEIGHT + 1e-4;
+const isGrounded = () =>
+    targetPos.y <= terrainHeightAt(targetPos.x, targetPos.z) + HOVER_HEIGHT + 1e-4;
 
 const keyMap = {
     KeyW: 'w', ArrowUp: 'w',
@@ -1245,6 +1382,11 @@ function animate() {
     targetPos.x += velocity.x * dt;
     targetPos.z += velocity.z * dt;
 
+    // Hover level tracks the terrain surface under the orb, so it floats a fixed
+    // gap above the hills/valleys. Gravity (always applied below) pulls it down
+    // to this level each frame, letting it follow the ground as it roams.
+    const hoverY = terrainHeightAt(targetPos.x, targetPos.z) + HOVER_HEIGHT;
+
     // Propulsion phase: apply upward thrust so the launch accelerates from
     // zero instead of starting at full speed.
     if (jumpThrustTime > 0) {
@@ -1256,9 +1398,9 @@ function animate() {
     velocityY -= (velocityY > 0 ? params.gravityUp : params.gravityDown) * dt;
 
     // Soft landing — exponentially damp downward velocity as we approach
-    // the hover plane, so the fall eases out at the very end.
+    // the hover level, so the fall eases out at the very end.
     if (velocityY < 0) {
-        const heightAbove = targetPos.y - HOVER_HEIGHT;
+        const heightAbove = targetPos.y - hoverY;
         if (heightAbove > 0 && heightAbove < SOFT_LAND_DISTANCE) {
             const proximity = 1 - heightAbove / SOFT_LAND_DISTANCE;
             velocityY *= Math.exp(-SOFT_LAND_DAMPING * proximity * dt);
@@ -1266,8 +1408,8 @@ function animate() {
     }
 
     targetPos.y += velocityY * dt;
-    if (targetPos.y < HOVER_HEIGHT) {
-        targetPos.y = HOVER_HEIGHT;
+    if (targetPos.y < hoverY) {
+        targetPos.y = hoverY;
         velocityY = 0;
     }
 
