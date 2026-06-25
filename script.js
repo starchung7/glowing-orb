@@ -177,7 +177,7 @@ const params = {
     grassLightRange: 2.0,     // how far the orb glow reaches the grass
     // Scattered trees — one InstancedMesh per source sub-mesh (lightweight).
     treeCount: 60,            // number of scattered trees
-    treeHeight: 2.5,          // target world height the model is normalised to
+    treeHeight: 1.25,         // target world height the model is normalised to
     treeAreaRadius: 21,       // trees scatter within this radius of spawn
     treeClearing: 4,          // keep a clear circle around spawn (no trees)
     // World boundary: roam too far from spawn and a thick fog rolls in and
