@@ -35,6 +35,12 @@ if (!terrainMesh) {
         if (c > maxCount) { maxCount = c; terrainMesh = o; }
     });
 }
+// Shrink the terrain uniformly. Applied before bounds, heightmap, and trimesh
+// are derived below so every consumer (orb hover, grass, physics) conforms to
+// the scaled surface automatically. Local scale survives the later reparent to
+// the scene root, so the rendered mesh matches the baked data.
+const TERRAIN_SCALE = 0.5; // 1/2 of the authored size
+terrainMesh.scale.multiplyScalar(TERRAIN_SCALE);
 terrainMesh.updateMatrixWorld(true);
 terrainMesh.receiveShadow = false;
 terrainMesh.frustumCulled = false;
