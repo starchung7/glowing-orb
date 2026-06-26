@@ -147,6 +147,7 @@ const params = {
     orbRadius: 0.008,
     orbLightIntensity: 1.5,
     orbLightColor: '#ccccff',
+    shadowsEnabled: true,
     moveSpeed: 2.5,
     accelRate: 4,
     jumpThrustAccel: 30,
@@ -957,6 +958,7 @@ const grassMaterial = new THREE.RawShaderMaterial({
         uHeightRange: { value: TERRAIN_HEIGHT_RANGE },
         // Point-light shadow receiving (manually wired — RawShaderMaterial is
         // invisible to three's automatic shadow plumbing).
+        uShadowEnabled: { value: 1 },
         uShadowMap: { value: grassShadowFallback },
         uShadowMapSize: { value: new THREE.Vector2(1, 1) },
         uShadowBias: { value: 0 },
@@ -1000,6 +1002,7 @@ const grassMaterial = new THREE.RawShaderMaterial({
         // Point-light shadow receiving. These mirror three's own
         // shadowmap_pars_fragment / packing chunks so the grass reads the exact
         // same packed-distance cube map the renderer fills for the orb light.
+        uniform float uShadowEnabled;
         uniform sampler2D uShadowMap;
         uniform vec2 uShadowMapSize;
         uniform float uShadowBias;
@@ -1069,8 +1072,11 @@ const grassMaterial = new THREE.RawShaderMaterial({
 
             // Receive: the orb's contribution is gated by the point shadow cube.
             // lightToPosition (worldPos - lightPos) is exactly three's point-light
-            // shadow coordinate, so getPointShadow() matches the renderer.
-            float shadow = getPointShadow(vWorldPos - uOrbPos);
+            // shadow coordinate, so getPointShadow() matches the renderer. When
+            // shadows are toggled off, fall back to fully lit (1.0).
+            float shadow = uShadowEnabled > 0.5
+                ? getPointShadow(vWorldPos - uOrbPos)
+                : 1.0;
             vec3 lit = uAmbient +
                 uOrbColor * uOrbIntensity * atten * (0.4 + 0.6 * ndl) * shadow;
             vec3 col = albedo * lit;
@@ -1407,6 +1413,15 @@ const moveDir = new THREE.Vector3();
 const velocity = new THREE.Vector3();
 const targetVelocity = new THREE.Vector3();
 
+// Flip the whole shadow pipeline on/off: the orb stops rendering its depth cube
+// (so nothing casts), and the grass falls back to fully-lit receiving.
+function applyShadowsEnabled(v) {
+    orbLight.castShadow = v;
+    grass.castShadow = v;
+    grassMaterial.uniforms.uShadowEnabled.value = v ? 1 : 0;
+    if (!v) grassMaterial.uniforms.uShadowMap.value = grassShadowFallback;
+}
+
 // --- Live controls (lil-gui) ---
 const gui = new GUI({ title: 'Controls' });
 
@@ -1419,6 +1434,7 @@ orbFolder.add(orbLight, 'intensity', 0, 5, 0.1).name('light intensity');
 orbFolder.add(orbLight, 'distance', 0.5, 8, 0.1).name('light distance');
 orbFolder.addColor(params, 'orbLightColor').name('light color')
     .onChange((v) => orbLight.color.set(v));
+orbFolder.add(params, 'shadowsEnabled').name('shadows').onChange(applyShadowsEnabled);
 
 const moveFolder = gui.addFolder('Movement');
 moveFolder.add(params, 'moveSpeed', 0.5, 6, 0.1).name('speed');
@@ -1711,7 +1727,9 @@ function animate() {
 
     // Hand the grass the orb light's live point-shadow cube + parameters so it
     // can receive shadows, and keep the caster's distance reference in sync.
-    if (orbLight.shadow.map) gu.uShadowMap.value = orbLight.shadow.map.texture;
+    if (params.shadowsEnabled && orbLight.shadow.map) {
+        gu.uShadowMap.value = orbLight.shadow.map.texture;
+    }
     gu.uShadowMapSize.value.copy(orbLight.shadow.mapSize);
     gu.uShadowBias.value = orbLight.shadow.bias;
     gu.uShadowRadius.value = orbLight.shadow.radius;
