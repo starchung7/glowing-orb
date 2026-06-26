@@ -42,7 +42,8 @@ if (!terrainMesh) {
 const TERRAIN_SCALE = 0.5; // 1/2 of the authored size
 terrainMesh.scale.multiplyScalar(TERRAIN_SCALE);
 terrainMesh.updateMatrixWorld(true);
-terrainMesh.receiveShadow = false;
+terrainMesh.castShadow = true;
+terrainMesh.receiveShadow = true;
 terrainMesh.frustumCulled = false;
 
 // World-space bounds of the terrain, used to map XZ → heightmap UV.
@@ -174,7 +175,13 @@ const params = {
     grassColorBase: '#342b4a',// shaded blade base
     grassColorTip: '#615c7a', // lit blade tip
     grassWindStrength: 0.4,   // sway amplitude
-    grassLightRange: 2.0,     // how far the orb glow reaches the grass
+    grassLightRange: 4.0,     // how far the orb glow reaches the grass
+    // Light repulsor: the orb's light shoves nearby blade apexes away from it,
+    // logarithmic falloff out to grassRepulsorRadius, diminished as the light
+    // floats higher above the grass.
+    grassRepulsorStrength: 0.08, // max horizontal apex push (world units)
+    grassRepulsorRadius: 5.0,    // horizontal reach of the repulsor (world units)
+    grassRepulsorAltFalloff: 4.0,// how strongly the light's altitude weakens it
     // Scattered trees — one InstancedMesh per source sub-mesh (lightweight).
     treeCount: 60,            // number of scattered trees
     treeHeight: 1.25,         // target world height the model is normalised to
@@ -217,6 +224,10 @@ renderer.setPixelRatio(
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
+// Omnidirectional shadows: the orb's point light casts into a cube depth map.
+// PCF soft filtering softens the cube-map edges a little.
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
 // --- Post-processing: fake depth-of-field via a radial edge blur ---
@@ -330,6 +341,8 @@ syncComposerSize();
 // avoid colour banding in the dark terrain-to-fog gradient.
 terrainMesh.traverse((o) => {
     if (o.isMesh && o.material) {
+        o.castShadow = true;    // hills shadow the grass / each other
+        o.receiveShadow = true; // the ground catches the orb's cast shadows
         const mats = Array.isArray(o.material) ? o.material : [o.material];
         for (const mat of mats) mat.dithering = true;
     }
@@ -344,7 +357,17 @@ const orb = new THREE.Mesh(
 scene.add(orb);
 
 // A point light at the orb to faintly illuminate the floor around it
-const orbLight = new THREE.PointLight(params.orbLightColor, params.orbLightIntensity, 2.5, 2);
+const orbLight = new THREE.PointLight(params.orbLightColor, params.orbLightIntensity, 5.0, 2);
+// Omnidirectional depth-mapped shadow. A PointLight shadow renders the scene
+// into the six faces of a cube depth map; mapSize is the per-face resolution, so
+// 2048² gives 2048×2048 on each face (well above the 1024² minimum). The shadow
+// camera spans from just outside the orb to the edge of its light reach.
+orbLight.castShadow = true;
+orbLight.shadow.mapSize.set(2048, 2048);
+orbLight.shadow.camera.near = 0.02;
+orbLight.shadow.camera.far = 6;
+orbLight.shadow.bias = -0.002;
+orbLight.shadow.normalBias = 0.02;
 orb.add(orbLight);
 
 // Hover + bobbing — the orb floats a fixed gap above the terrain surface and
@@ -401,6 +424,8 @@ const BOX_LAYOUT = [
 ];
 for (const [x, z] of BOX_LAYOUT) {
     const mesh = new THREE.Mesh(boxGeo, boxMat);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
     scene.add(mesh);
     const body = world.createRigidBody(
         RAPIER.RigidBodyDesc.dynamic()
@@ -460,6 +485,10 @@ const trailMaterial = new THREE.MeshBasicMaterial({
 const trailMesh = new THREE.Mesh(trailGeometry, trailMaterial);
 trailMesh.frustumCulled = false;
 trailMesh.visible = false;
+// The emissive trail is a glow ribbon, not an occluder — keep it out of the
+// shadow pass so it never casts a shadow from the orb light.
+trailMesh.castShadow = false;
+trailMesh.receiveShadow = false;
 scene.add(trailMesh);
 
 // Reused scratch vectors so the per-frame update allocates nothing.
@@ -545,8 +574,8 @@ function updateTrail(dt) {
 }
 
 // Subtle ambient + hemisphere fill so the floor isn't pitch black everywhere
-scene.add(new THREE.AmbientLight(0xffffff, 0.08));
-scene.add(new THREE.HemisphereLight(0xffffff, 0x101010, 0.15));
+scene.add(new THREE.AmbientLight(0xffffff, 0.0));
+scene.add(new THREE.HemisphereLight(0xffffff, 0x101010, 0.0));
 
 // Floating dust particles — a single GPU point cloud (one draw call) whose
 // brightness reacts to the orb's light. Lighting and drift are computed in the
@@ -555,7 +584,7 @@ const PARTICLE_COUNT = 600;
 const PARTICLE_AREA = 6;        // half-extent of the spawn volume in X/Z
 const PARTICLE_Y_MIN = 0.15;
 const PARTICLE_Y_MAX = 4.0;
-const PARTICLE_LIGHT_RANGE = 3.5; // how far the orb's glow reaches a particle
+const PARTICLE_LIGHT_RANGE = 7.0; // how far the orb's glow reaches a particle
 
 const particleGeo = new THREE.BufferGeometry();
 const pPositions = new Float32Array(PARTICLE_COUNT * 3);
@@ -585,7 +614,7 @@ const particleMaterial = new THREE.ShaderMaterial({
         uTime: { value: 0 },
         uOrbPos: { value: new THREE.Vector3() },
         uLightColor: { value: new THREE.Color(0xccccff) },
-        uAmbient: { value: new THREE.Color(0x0a0c14) },
+        uAmbient: { value: new THREE.Color(0x000000) },
         uLightRange: { value: PARTICLE_LIGHT_RANGE },
         uSizeScale: { value: 7.0 },
         uPixelRatio: { value: renderer.getPixelRatio() },
@@ -719,18 +748,22 @@ const grassNoise = makeNoiseTexture();
 const GRASS_RADIUS = 24;              // patch half-extent (fog hides the boundary)
 const GRASS_SIZE = GRASS_RADIUS * 2;
 
-// Build the non-indexed blade geometry for a given subdivision count (density).
-// 3 verts per blade: 'position' (itemSize 2) holds the blade's ground centre,
-// repeated per vertex; aCorner tags tip(0)/left(1)/right(2). Blades are placed
-// on the GPU, so the tiny bounding sphere + frustumCulled=false keep Three from
-// wrongly culling the mesh.
+// Build the indexed cone-blade geometry for a given subdivision count (density).
+// Each blade is a 3-sided cone (pyramid): 3 base vertices on the ground + 1 apex
+// on top, drawn as 3 side faces. 'position' (itemSize 2) holds the blade's ground
+// centre, repeated per vertex; aCorner tags apex(0) / base corners (1,2,3). The
+// mesh is indexed so each blade contributes only its 4 unique vertices (the
+// shader runs per unique vertex) instead of 9. Blades are placed on the GPU, so
+// the tiny bounding sphere + frustumCulled=false keep Three from culling it.
 function buildGrassGeometry(subdivisions) {
     const count = subdivisions * subdivisions;
     const cell = GRASS_SIZE / subdivisions;
-    const ground = new Float32Array(count * 3 * 2);
-    const corner = new Float32Array(count * 3);
-    const heightRand = new Float32Array(count * 3);
-    let v = 0;
+    const VERTS = 4; // apex + 3 base corners
+    const ground = new Float32Array(count * VERTS * 2);
+    const corner = new Float32Array(count * VERTS);
+    const heightRand = new Float32Array(count * VERTS);
+    const index = new Uint32Array(count * 9); // 3 side faces × 3 verts
+    let v = 0, f = 0;
     for (let iX = 0; iX < subdivisions; iX++) {
         const cellX = (iX / subdivisions - 0.5) * GRASS_SIZE + cell * 0.5;
         for (let iZ = 0; iZ < subdivisions; iZ++) {
@@ -738,25 +771,155 @@ function buildGrassGeometry(subdivisions) {
             const px = cellX + (Math.random() - 0.5) * cell;
             const pz = cellZ + (Math.random() - 0.5) * cell;
             const hr = Math.random();
-            for (let c = 0; c < 3; c++) {
+            const base = v; // first vertex index of this blade
+            for (let c = 0; c < VERTS; c++) {
                 ground[v * 2] = px;
                 ground[v * 2 + 1] = pz;
-                corner[v] = c;
+                corner[v] = c; // 0 = apex, 1..3 = base corners
                 heightRand[v] = hr;
                 v++;
             }
+            // Three side faces, each spanning the apex and two adjacent base
+            // corners (winding doesn't matter — the material is DoubleSide).
+            const apex = base, b0 = base + 1, b1 = base + 2, b2 = base + 3;
+            index[f++] = apex; index[f++] = b0; index[f++] = b1;
+            index[f++] = apex; index[f++] = b1; index[f++] = b2;
+            index[f++] = apex; index[f++] = b2; index[f++] = b0;
         }
     }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(ground, 2));
     geo.setAttribute('aCorner', new THREE.BufferAttribute(corner, 1));
     geo.setAttribute('aHeightRand', new THREE.BufferAttribute(heightRand, 1));
+    geo.setIndex(new THREE.BufferAttribute(index, 1));
     geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1);
     return geo;
 }
 const grassGeometry = buildGrassGeometry(params.grassDensity);
 
 const grassWindAngle = Math.PI * 0.6;
+
+// 1×1 stand-in shadow map (packed depth ≈ 1.0 → "nothing closer", i.e. fully
+// lit) used until the point light has rendered its cube map for the first time,
+// so the grass isn't briefly self-shadowed on frame 0.
+const grassShadowFallback = new THREE.DataTexture(
+    new Uint8Array([0, 0, 0, 255]), 1, 1, THREE.RGBAFormat,
+);
+grassShadowFallback.needsUpdate = true;
+
+// Shared vertex-stage code for the grass. Both the visible material and the
+// shadow (customDistance) material run the EXACT same displacement — cone shape,
+// infinite tiling, terrain conform, height, wind and the light repulsor — so the
+// cast shadow lines up perfectly with the rendered blades. grassVertex() returns
+// the object-space vertex and also outputs the apex factor + world position.
+const GRASS_VERTEX_HEAD = /* glsl */ `
+    precision highp float;
+    uniform mat4 projectionMatrix;
+    uniform mat4 modelViewMatrix;
+    uniform mat4 modelMatrix;
+    uniform vec3 cameraPosition;
+
+    in vec2 position;       // blade ground centre (xz)
+    in float aCorner;       // 0 = apex, 1..3 = base corners
+    in float aHeightRand;
+
+    uniform vec2 uCenter;
+    uniform float uSize;
+    uniform float uTime;
+    uniform sampler2D uNoise;
+    uniform float uBladeWidth;
+    uniform float uBladeHeight;
+    uniform float uHeightRand;
+    uniform float uHeightNoiseScale;
+    uniform vec2 uWindDir;
+    uniform float uWindStrength;
+    uniform float uWindFreq;
+    uniform vec3 uOrbPos;       // world-space orb light position
+    uniform float uRepulsorStrength;
+    uniform float uRepulsorRadius;
+    uniform float uRepulsorAltFalloff;
+    uniform sampler2D uHeightMap;
+    uniform vec2 uTerrainMin;
+    uniform vec2 uTerrainSize;
+    uniform float uHeightMin;
+    uniform float uHeightRange;
+
+    vec2 windOffset(vec2 p) {
+        vec2 rp = p * uWindFreq;
+        float n1 = texture(uNoise, rp * 0.2 + uWindDir * uTime).r - 0.5;
+        float n2 = texture(uNoise, rp * 0.1 + uWindDir * (uTime * 0.2)).r - 0.5;
+        return uWindDir * (n1 + n2) * uWindStrength;
+    }
+
+    vec3 grassVertex(out float vTipOut, out vec3 vWorldOut) {
+        // Cone blade corner: aCorner 0 = apex, 1..3 = the three base corners. A
+        // per-blade yaw (from aHeightRand) spins the base triangle so the cones
+        // don't all share the same orientation.
+        float tip = step(aCorner, 0.5);
+        float baseIdx = aCorner - 1.0;             // 0,1,2 for the base verts
+        float yaw = aHeightRand * 6.2831853;
+        float bAng = baseIdx * 2.0943951 + yaw;    // 120° apart + per-blade yaw
+        vec2 baseDir = vec2(cos(bAng), sin(bAng));
+
+        // Infinite tiling: wrap the blade into the patch window around centre.
+        float halfSize = uSize * 0.5;
+        vec2 loop = position - uCenter;
+        loop.x = mod(loop.x + halfSize, uSize) - halfSize;
+        loop.y = mod(loop.y + halfSize, uSize) - halfSize;
+        vec3 ground = vec3(loop.x + uCenter.x, 0.0, loop.y + uCenter.y);
+
+        vec4 worldBase = modelMatrix * vec4(ground, 1.0);
+        vec2 bladeXZ = worldBase.xz;
+
+        // Conform the blade to the terrain: lift its base to the sampled ground
+        // height so the whole field drapes over the hills/valleys.
+        vec2 hUV = (bladeXZ - uTerrainMin) / uTerrainSize;
+        ground.y += uHeightMin + texture(uHeightMap, hUV).r * uHeightRange;
+
+        // Height + wind only affect the apex — the three base corners stay flat
+        // on the ground and don't sway. So gate their noise fetch behind the apex
+        // test and skip it for 3/4 of the vertices.
+        float height = 0.0;
+        if (tip > 0.5) {
+            float hn = texture(uNoise, bladeXZ * uHeightNoiseScale).r + 0.5;
+            height = uBladeHeight *
+                (uHeightRand * aHeightRand + (1.0 - uHeightRand)) * hn;
+        }
+
+        // The apex rises to 'height' above the centre; the three base corners sit
+        // on the ground around it (radius = uBladeWidth), forming a cone.
+        vec3 local = tip > 0.5
+            ? vec3(0.0, height, 0.0)
+            : vec3(baseDir.x * uBladeWidth, 0.0, baseDir.y * uBladeWidth);
+        vec3 vertPos = ground + local;
+
+        // Wind sways the apex only, scaled by height.
+        if (tip > 0.5) {
+            vec2 wind = windOffset(bladeXZ) * height * 2.0;
+            vertPos.x += wind.x;
+            vertPos.z += wind.y;
+
+            // Light repulsor: shove the apex horizontally away from the orb's
+            // world-space light. Linear falloff to zero at uRepulsorRadius, and
+            // diminished as the light climbs above the apex.
+            vec2 fromLight = vertPos.xz - uOrbPos.xz;
+            float rd = length(fromLight);
+            if (rd < uRepulsorRadius && rd > 1e-5) {
+                float t = rd / uRepulsorRadius;       // 0 at light -> 1 at edge
+                float falloff = 1.0 - t;              // linear falloff to zero
+                float dy = max(uOrbPos.y - vertPos.y, 0.0);
+                float altFactor = 1.0 / (1.0 + dy * dy * uRepulsorAltFalloff);
+                vertPos.xz += (fromLight / rd) *
+                    (uRepulsorStrength * falloff * altFactor);
+            }
+        }
+
+        vWorldOut = (modelMatrix * vec4(vertPos, 1.0)).xyz;
+        vTipOut = tip;
+        return vertPos;
+    }
+`;
+
 const grassMaterial = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
     // Blades are flat billboards — show both faces so they can never be culled
@@ -774,14 +937,16 @@ const grassMaterial = new THREE.RawShaderMaterial({
         uWindDir: { value: new THREE.Vector2(Math.sin(grassWindAngle), Math.cos(grassWindAngle)) },
         uWindStrength: { value: params.grassWindStrength },
         uWindFreq: { value: 0.5 },
-        uViewDir: { value: new THREE.Vector2(0, -1) },
         uColorBase: { value: new THREE.Color(params.grassColorBase) },
         uColorTip: { value: new THREE.Color(params.grassColorTip) },
-        uAmbient: { value: new THREE.Color(0x4a5570) },
+        uAmbient: { value: new THREE.Color(0x000000) },
         uOrbPos: { value: new THREE.Vector3() },
         uOrbColor: { value: new THREE.Color(params.orbLightColor) },
         uOrbIntensity: { value: params.orbLightIntensity },
         uOrbRange: { value: params.grassLightRange },
+        uRepulsorStrength: { value: params.grassRepulsorStrength },
+        uRepulsorRadius: { value: params.grassRepulsorRadius },
+        uRepulsorAltFalloff: { value: params.grassRepulsorAltFalloff },
         uFogColor: { value: new THREE.Color(params.fogColor) },
         uFogDensity: { value: params.fogDensity },
         // Terrain conforming: blades ride the baked height texture.
@@ -790,103 +955,27 @@ const grassMaterial = new THREE.RawShaderMaterial({
         uTerrainSize: { value: new THREE.Vector2(TERRAIN_SIZE_X, TERRAIN_SIZE_Z) },
         uHeightMin: { value: TERRAIN_HEIGHT_MIN },
         uHeightRange: { value: TERRAIN_HEIGHT_RANGE },
+        // Point-light shadow receiving (manually wired — RawShaderMaterial is
+        // invisible to three's automatic shadow plumbing).
+        uShadowMap: { value: grassShadowFallback },
+        uShadowMapSize: { value: new THREE.Vector2(1, 1) },
+        uShadowBias: { value: 0 },
+        uShadowRadius: { value: 1 },
+        uShadowNear: { value: 0.1 },
+        uShadowFar: { value: 6 },
     },
-    vertexShader: /* glsl */ `
-        precision highp float;
-        uniform mat4 projectionMatrix;
-        uniform mat4 modelViewMatrix;
-        uniform mat4 modelMatrix;
-        uniform vec3 cameraPosition;
-
-        in vec2 position;       // blade ground centre (xz)
-        in float aCorner;       // 0 = tip, 1 = left, 2 = right
-        in float aHeightRand;
-
-        uniform vec2 uCenter;
-        uniform float uSize;
-        uniform float uTime;
-        uniform sampler2D uNoise;
-        uniform float uBladeWidth;
-        uniform float uBladeHeight;
-        uniform float uHeightRand;
-        uniform float uHeightNoiseScale;
-        uniform vec2 uWindDir;
-        uniform float uWindStrength;
-        uniform float uWindFreq;
-        uniform vec2 uViewDir;      // camera's horizontal forward direction
-        uniform sampler2D uHeightMap;
-        uniform vec2 uTerrainMin;
-        uniform vec2 uTerrainSize;
-        uniform float uHeightMin;
-        uniform float uHeightRange;
-
+    vertexShader: GRASS_VERTEX_HEAD + /* glsl */ `
         out float vTip;
         out vec3 vWorldPos;
         out float vFogDist;
 
-        vec2 windOffset(vec2 p) {
-            vec2 rp = p * uWindFreq;
-            float n1 = texture(uNoise, rp * 0.2 + uWindDir * uTime).r - 0.5;
-            float n2 = texture(uNoise, rp * 0.1 + uWindDir * (uTime * 0.2)).r - 0.5;
-            return uWindDir * (n1 + n2) * uWindStrength;
-        }
-
         void main() {
-            // Local blade triangle corner: tip (0,1), left (1,0), right (-1,0).
-            vec2 shape;
-            if (aCorner < 0.5)      shape = vec2(0.0, 1.0);
-            else if (aCorner < 1.5) shape = vec2(1.0, 0.0);
-            else                    shape = vec2(-1.0, 0.0);
-            float tip = step(aCorner, 0.5);
-
-            // Infinite tiling: wrap the blade into the patch window around centre.
-            float halfSize = uSize * 0.5;
-            vec2 loop = position - uCenter;
-            loop.x = mod(loop.x + halfSize, uSize) - halfSize;
-            loop.y = mod(loop.y + halfSize, uSize) - halfSize;
-            vec3 ground = vec3(loop.x + uCenter.x, 0.0, loop.y + uCenter.y);
-
-            vec4 worldBase = modelMatrix * vec4(ground, 1.0);
-            vec2 bladeXZ = worldBase.xz;
-
-            // Conform the blade to the terrain: lift its base to the sampled
-            // ground height so the whole field drapes over the hills/valleys.
-            vec2 hUV = (bladeXZ - uTerrainMin) / uTerrainSize;
-            ground.y += uHeightMin + texture(uHeightMap, hUV).r * uHeightRange;
-
-            // Height + wind only move the tip vertex — the two base corners stay
-            // flat on the ground (shape.y = 0) and don't sway. So gate their noise
-            // texture fetches behind the tip test and skip them for ~2/3 of verts.
-            float height = 0.0;
-            if (tip > 0.5) {
-                float hn = texture(uNoise, bladeXZ * uHeightNoiseScale).r + 0.5;
-                height = uBladeHeight *
-                    (uHeightRand * aHeightRand + (1.0 - uHeightRand)) * hn;
-            }
-
-            vec3 vertPos = ground + vec3(shape.x * uBladeWidth, shape.y * height, 0.0);
-
-            // View-aligned billboard: orient every blade's flat face perpendicular
-            // to the camera's viewing DIRECTION (not its position). Since all blades
-            // share the same view direction, they don't swivel as the camera moves
-            // around — they only re-orient if the camera actually rotates.
-            float ang = atan(uViewDir.y, uViewDir.x) - 1.5707963;
-            vec2 d = vertPos.xz - ground.xz;
-            float ca = cos(ang), sa = sin(ang);
-            vertPos.xz = ground.xz + vec2(ca * d.x - sa * d.y, sa * d.x + ca * d.y);
-
-            // Wind sways the tip only, scaled by height (base verts skipped above).
-            if (tip > 0.5) {
-                vec2 wind = windOffset(bladeXZ) * height * 2.0;
-                vertPos.x += wind.x;
-                vertPos.z += wind.y;
-            }
-
-            vec4 world = modelMatrix * vec4(vertPos, 1.0);
-            vWorldPos = world.xyz;
+            float tip;
+            vec3 wp;
+            vec3 vertPos = grassVertex(tip, wp);
             vTip = tip;
-            vFogDist = distance(world.xyz, cameraPosition);
-
+            vWorldPos = wp;
+            vFogDist = distance(wp, cameraPosition);
             gl_Position = projectionMatrix * modelViewMatrix * vec4(vertPos, 1.0);
         }
     `,
@@ -908,6 +997,63 @@ const grassMaterial = new THREE.RawShaderMaterial({
         uniform vec3 uFogColor;
         uniform float uFogDensity;
 
+        // Point-light shadow receiving. These mirror three's own
+        // shadowmap_pars_fragment / packing chunks so the grass reads the exact
+        // same packed-distance cube map the renderer fills for the orb light.
+        uniform sampler2D uShadowMap;
+        uniform vec2 uShadowMapSize;
+        uniform float uShadowBias;
+        uniform float uShadowRadius;
+        uniform float uShadowNear;
+        uniform float uShadowFar;
+
+        const float UnpackDownscale = 255.0 / 256.0;
+        const vec3 PackFactors = vec3(256.0 * 256.0 * 256.0, 256.0 * 256.0, 256.0);
+        const vec4 UnpackFactors = UnpackDownscale / vec4(PackFactors, 1.0);
+        float unpackRGBAToDepth(const in vec4 v) { return dot(v, UnpackFactors); }
+        float texture2DCompare(sampler2D depths, vec2 uv, float compare) {
+            return step(compare, unpackRGBAToDepth(texture(depths, uv)));
+        }
+        vec2 cubeToUV(vec3 v, float texelSizeY) {
+            vec3 absV = abs(v);
+            float scaleToCube = 1.0 / max(absV.x, max(absV.y, absV.z));
+            absV *= scaleToCube;
+            v *= scaleToCube * (1.0 - 2.0 * texelSizeY);
+            vec2 planar = v.xy;
+            float almostATexel = 1.5 * texelSizeY;
+            float almostOne = 1.0 - almostATexel;
+            if (absV.z >= almostOne) {
+                if (v.z > 0.0) planar.x = 4.0 - v.x;
+            } else if (absV.x >= almostOne) {
+                float signX = sign(v.x);
+                planar.x = v.z * signX + 2.0 * signX;
+            } else if (absV.y >= almostOne) {
+                float signY = sign(v.y);
+                planar.x = v.x + 2.0 * signY + 2.0;
+                planar.y = v.z * signY - 2.0;
+            }
+            return vec2(0.125, 0.25) * planar + vec2(0.375, 0.75);
+        }
+        float getPointShadow(vec3 lightToPosition) {
+            vec2 texelSize = vec2(1.0) / (uShadowMapSize * vec2(4.0, 2.0));
+            float dp = (length(lightToPosition) - uShadowNear) /
+                (uShadowFar - uShadowNear);
+            dp += uShadowBias;
+            vec3 bd3D = normalize(lightToPosition);
+            vec2 offset = vec2(-1.0, 1.0) * uShadowRadius * texelSize.y;
+            return (
+                texture2DCompare(uShadowMap, cubeToUV(bd3D + offset.xyy, texelSize.y), dp) +
+                texture2DCompare(uShadowMap, cubeToUV(bd3D + offset.yyy, texelSize.y), dp) +
+                texture2DCompare(uShadowMap, cubeToUV(bd3D + offset.xyx, texelSize.y), dp) +
+                texture2DCompare(uShadowMap, cubeToUV(bd3D + offset.yyx, texelSize.y), dp) +
+                texture2DCompare(uShadowMap, cubeToUV(bd3D, texelSize.y), dp) +
+                texture2DCompare(uShadowMap, cubeToUV(bd3D + offset.xxy, texelSize.y), dp) +
+                texture2DCompare(uShadowMap, cubeToUV(bd3D + offset.yxy, texelSize.y), dp) +
+                texture2DCompare(uShadowMap, cubeToUV(bd3D + offset.xxx, texelSize.y), dp) +
+                texture2DCompare(uShadowMap, cubeToUV(bd3D + offset.yxx, texelSize.y), dp)
+            ) * (1.0 / 9.0);
+        }
+
         void main() {
             // Base-darkening AO: dark at the root, full bright at the tip.
             float ao = mix(0.4, 1.0, vTip);
@@ -920,7 +1066,13 @@ const grassMaterial = new THREE.RawShaderMaterial({
             float dist = length(toLight);
             float atten = pow(clamp(1.0 - dist / uOrbRange, 0.0, 1.0), 2.0);
             float ndl = max(dot(N, normalize(toLight)), 0.0);
-            vec3 lit = uAmbient + uOrbColor * uOrbIntensity * atten * (0.4 + 0.6 * ndl);
+
+            // Receive: the orb's contribution is gated by the point shadow cube.
+            // lightToPosition (worldPos - lightPos) is exactly three's point-light
+            // shadow coordinate, so getPointShadow() matches the renderer.
+            float shadow = getPointShadow(vWorldPos - uOrbPos);
+            vec3 lit = uAmbient +
+                uOrbColor * uOrbIntensity * atten * (0.4 + 0.6 * ndl) * shadow;
             vec3 col = albedo * lit;
 
             // Exponential-squared fog to match scene.fog (FogExp2).
@@ -932,8 +1084,86 @@ const grassMaterial = new THREE.RawShaderMaterial({
     `,
 });
 
+// Shadow caster for the grass: a customDistanceMaterial that re-runs the exact
+// same vertex displacement (via the shared GRASS_VERTEX_HEAD) and packs the
+// light→fragment distance the same way three's MeshDistanceMaterial does, so the
+// blades punch correct holes into the orb light's depth cube. It shares the live
+// uniform objects with grassMaterial so wind/repulsor/terrain all stay in sync.
+const gu = grassMaterial.uniforms;
+const grassDistanceMaterial = new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    side: THREE.DoubleSide,
+    uniforms: {
+        uCenter: gu.uCenter,
+        uSize: gu.uSize,
+        uTime: gu.uTime,
+        uNoise: gu.uNoise,
+        uBladeWidth: gu.uBladeWidth,
+        uBladeHeight: gu.uBladeHeight,
+        uHeightRand: gu.uHeightRand,
+        uHeightNoiseScale: gu.uHeightNoiseScale,
+        uWindDir: gu.uWindDir,
+        uWindStrength: gu.uWindStrength,
+        uWindFreq: gu.uWindFreq,
+        uOrbPos: gu.uOrbPos,
+        uRepulsorStrength: gu.uRepulsorStrength,
+        uRepulsorRadius: gu.uRepulsorRadius,
+        uRepulsorAltFalloff: gu.uRepulsorAltFalloff,
+        uHeightMap: gu.uHeightMap,
+        uTerrainMin: gu.uTerrainMin,
+        uTerrainSize: gu.uTerrainSize,
+        uHeightMin: gu.uHeightMin,
+        uHeightRange: gu.uHeightRange,
+        // Set per frame to the light position + shadow camera near/far so the
+        // packed distance matches what the rest of the scene writes.
+        uRefPosition: { value: new THREE.Vector3() },
+        uNearDistance: { value: 0.1 },
+        uFarDistance: { value: 6 },
+    },
+    vertexShader: GRASS_VERTEX_HEAD + /* glsl */ `
+        out vec3 vWorldPosition;
+
+        void main() {
+            float tip;
+            vec3 wp;
+            vec3 vertPos = grassVertex(tip, wp);
+            vWorldPosition = wp;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(vertPos, 1.0);
+        }
+    `,
+    fragmentShader: /* glsl */ `
+        precision highp float;
+
+        in vec3 vWorldPosition;
+        out vec4 fragColor;
+
+        uniform vec3 uRefPosition;
+        uniform float uNearDistance;
+        uniform float uFarDistance;
+
+        const float PackUpscale = 256.0 / 255.0;
+        const vec3 PackFactors = vec3(256.0 * 256.0 * 256.0, 256.0 * 256.0, 256.0);
+        const float ShiftRight8 = 1.0 / 256.0;
+        vec4 packDepthToRGBA(const in float v) {
+            vec4 r = vec4(fract(v * PackFactors), v);
+            r.yzw -= r.xyz * ShiftRight8;
+            return r * PackUpscale;
+        }
+
+        void main() {
+            float dist = length(vWorldPosition - uRefPosition);
+            dist = (dist - uNearDistance) / (uFarDistance - uNearDistance);
+            dist = clamp(dist, 0.0, 1.0);
+            fragColor = packDepthToRGBA(dist);
+        }
+    `,
+});
+
 const grass = new THREE.Mesh(grassGeometry, grassMaterial);
 grass.frustumCulled = false;
+grass.castShadow = true;
+grass.receiveShadow = true;
+grass.customDistanceMaterial = grassDistanceMaterial;
 scene.add(grass);
 
 // ----------------------------------------------------------------------------
@@ -998,6 +1228,8 @@ function buildTrees() {
     // the model so multi-part trees (trunk + leaves) reconstruct correctly.
     for (const { geometry, material, matrix } of treeSources) {
         const inst = new THREE.InstancedMesh(geometry, material, count);
+        inst.castShadow = true;
+        inst.receiveShadow = true;
         inst.frustumCulled = false; // instances span the whole area; skip culling
         for (let i = 0; i < count; i++) {
             _treeFinal.multiplyMatrices(instances[i], matrix);
@@ -1171,7 +1403,6 @@ window.addEventListener('resize', () => {
 
 const clock = new THREE.Clock();
 let grassWindTime = 0; // accumulated wind "localTime" (scaled by strength)
-const _grassCamDir = new THREE.Vector3(); // scratch for camera forward direction
 const moveDir = new THREE.Vector3();
 const velocity = new THREE.Vector3();
 const targetVelocity = new THREE.Vector3();
@@ -1253,6 +1484,12 @@ grassFolder.add(params, 'grassWindStrength', 0, 1.5, 0.05).name('wind')
     .onChange((v) => { grassMaterial.uniforms.uWindStrength.value = v; });
 grassFolder.add(params, 'grassLightRange', 1, 12, 0.5).name('glow range')
     .onChange((v) => { grassMaterial.uniforms.uOrbRange.value = v; });
+grassFolder.add(params, 'grassRepulsorStrength', 0, 0.5, 0.01).name('repulsor strength')
+    .onChange((v) => { grassMaterial.uniforms.uRepulsorStrength.value = v; });
+grassFolder.add(params, 'grassRepulsorRadius', 0.1, 8, 0.1).name('repulsor radius')
+    .onChange((v) => { grassMaterial.uniforms.uRepulsorRadius.value = v; });
+grassFolder.add(params, 'grassRepulsorAltFalloff', 0, 16, 0.5).name('repulsor altitude falloff')
+    .onChange((v) => { grassMaterial.uniforms.uRepulsorAltFalloff.value = v; });
 grassFolder.addColor(params, 'grassColorBase').name('base color')
     .onChange((v) => grassMaterial.uniforms.uColorBase.value.set(v));
 grassFolder.addColor(params, 'grassColorTip').name('tip color')
@@ -1464,12 +1701,6 @@ function animate() {
     // the orb glow + fog so the field matches the rest of the scene.
     const gu = grassMaterial.uniforms;
     gu.uCenter.value.set(targetPos.x, targetPos.z);
-    // View-aligned billboard direction: the camera's horizontal forward. Constant
-    // here (fixed 3/4 view), but synced each frame so it stays correct if it moves.
-    camera.getWorldDirection(_grassCamDir);
-    if (Math.abs(_grassCamDir.x) > 1e-6 || Math.abs(_grassCamDir.z) > 1e-6) {
-        gu.uViewDir.value.set(_grassCamDir.x, _grassCamDir.z).normalize();
-    }
     grassWindTime += dt * 0.1 * gu.uWindStrength.value; // localTime accumulation
     gu.uTime.value = grassWindTime;
     gu.uOrbPos.value.copy(orb.position);
@@ -1477,6 +1708,19 @@ function animate() {
     gu.uOrbIntensity.value = orbLight.intensity;
     gu.uFogColor.value.copy(scene.fog.color);
     gu.uFogDensity.value = scene.fog.density;
+
+    // Hand the grass the orb light's live point-shadow cube + parameters so it
+    // can receive shadows, and keep the caster's distance reference in sync.
+    if (orbLight.shadow.map) gu.uShadowMap.value = orbLight.shadow.map.texture;
+    gu.uShadowMapSize.value.copy(orbLight.shadow.mapSize);
+    gu.uShadowBias.value = orbLight.shadow.bias;
+    gu.uShadowRadius.value = orbLight.shadow.radius;
+    gu.uShadowNear.value = orbLight.shadow.camera.near;
+    gu.uShadowFar.value = orbLight.shadow.camera.far;
+    const gd = grassDistanceMaterial.uniforms;
+    gd.uRefPosition.value.copy(orb.position);
+    gd.uNearDistance.value = orbLight.shadow.camera.near;
+    gd.uFarDistance.value = orbLight.shadow.camera.far;
 
     // Drive the orb's kinematic body from targetPos (un-bobbed, so contacts
     // stay stable) — Rapier infers velocity from successive translations.
