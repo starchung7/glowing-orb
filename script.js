@@ -342,10 +342,10 @@ function syncComposerSize() {
 syncComposerSize();
 
 // Rolling terrain ground (from terrain.glb), replacing the old flat plane.
-// Swap the GLB's Blender-authored material for a stock THREE.MeshStandardMaterial
-// (Three's defaults: white, roughness 1, metalness 0). Dithering is enabled to
-// avoid colour banding in the dark terrain-to-fog gradient, and the colour is
-// tinted below from params.terrainColor.
+// Swap the GLB's Blender-authored material for a stock THREE.MeshLambertMaterial
+// (cheap non-PBR diffuse shading). Dithering is enabled to avoid colour banding
+// in the dark terrain-to-fog gradient, and the colour is tinted below from
+// params.terrainColor.
 const terrainMaterials = []; // collected so the GUI can recolour the terrain
 terrainMesh.traverse((o) => {
     if (o.isMesh && o.material) {
@@ -355,7 +355,7 @@ terrainMesh.traverse((o) => {
         for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
             m.dispose();
         }
-        const mat = new THREE.MeshStandardMaterial();
+        const mat = new THREE.MeshLambertMaterial();
         mat.dithering = true;
         o.material = mat;
         terrainMaterials.push(mat);
