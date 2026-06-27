@@ -180,6 +180,11 @@ const params = {
     pathEnabled: true,        // paint path.png onto the feature map's red areas
     pathTiling: 28,           // how many times the path texture repeats across the terrain
     pathTint: '#ffffff',      // multiplier tint applied to the path texture
+    // Patchiness: FBM noise erodes the path so it reads as old / unkempt, with
+    // bare ground showing through irregular gaps in the cobbles.
+    pathPatchiness: 0.85,     // 0 = solid path, 1 = fully noise-eroded
+    pathNoiseScale: 1.8,      // world-space frequency of the patch noise
+    pathSparseness: 0.5,      // higher = sparser path (more ground shows through)
     grassColorBase: '#342b4a',// shaded blade base
     grassColorTip: '#615c7a', // lit blade tip
     grassFeatureMaskEnabled: true, // restrict grass to the feature map's green areas
@@ -378,6 +383,9 @@ const pathUniforms = {
     uPathTiling: { value: params.pathTiling },
     uPathEnabled: { value: params.pathEnabled ? 1 : 0 },
     uPathTint: { value: new THREE.Color(params.pathTint) },
+    uPathPatchiness: { value: params.pathPatchiness },
+    uPathNoiseScale: { value: params.pathNoiseScale },
+    uPathSparseness: { value: params.pathSparseness },
 };
 
 function applyPathShader(mat) {
@@ -405,7 +413,36 @@ function applyPathShader(mat) {
                 uniform vec2 uPathTerrainSize;
                 uniform float uPathTiling;
                 uniform float uPathEnabled;
-                uniform vec3 uPathTint;`,
+                uniform vec3 uPathTint;
+                uniform float uPathPatchiness;
+                uniform float uPathNoiseScale;
+                uniform float uPathSparseness;
+
+                float pathHash21(vec2 p) {
+                    p = fract(p * vec2(123.34, 345.45));
+                    p += dot(p, p + 34.345);
+                    return fract(p.x * p.y);
+                }
+                float pathVNoise(vec2 p) {
+                    vec2 i = floor(p);
+                    vec2 f = fract(p);
+                    f = f * f * (3.0 - 2.0 * f);
+                    float a = pathHash21(i);
+                    float b = pathHash21(i + vec2(1.0, 0.0));
+                    float c = pathHash21(i + vec2(0.0, 1.0));
+                    float d = pathHash21(i + vec2(1.0, 1.0));
+                    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+                }
+                float pathFbm(vec2 p) {
+                    float v = 0.0;
+                    float amp = 0.5;
+                    for (int i = 0; i < 4; i++) {
+                        v += amp * pathVNoise(p);
+                        p *= 2.0;
+                        amp *= 0.5;
+                    }
+                    return v;
+                }`,
             )
             .replace(
                 'vec4 diffuseColor = vec4( diffuse, opacity );',
@@ -417,6 +454,10 @@ function applyPathShader(mat) {
                     float inside = step(0.0, featUV.x) * step(featUV.x, 1.0) *
                                    step(0.0, featUV.y) * step(featUV.y, 1.0);
                     float pathMask = smoothstep(0.02, 0.25, redness) * inside;
+                    // Erode the path with FBM noise so it looks old / patchy.
+                    float n = pathFbm(vPathWorld.xz * uPathNoiseScale);
+                    float patchMask = smoothstep(uPathSparseness - 0.18, uPathSparseness + 0.18, n);
+                    pathMask *= mix(1.0, patchMask, uPathPatchiness);
                     vec3 pathCol = texture2D(uPathMap, featUV * uPathTiling).rgb * uPathTint;
                     diffuseColor.rgb = mix(diffuseColor.rgb, pathCol, pathMask);
                 }`,
@@ -1695,6 +1736,15 @@ terrainFolder.add(params, 'pathTiling', 1, 60, 1).name('path tiling').onChange((
 });
 terrainFolder.addColor(params, 'pathTint').name('path tint').onChange((v) => {
     pathUniforms.uPathTint.value.set(v);
+});
+terrainFolder.add(params, 'pathPatchiness', 0, 1, 0.01).name('path patchiness').onChange((v) => {
+    pathUniforms.uPathPatchiness.value = v;
+});
+terrainFolder.add(params, 'pathNoiseScale', 0.2, 8, 0.1).name('patch scale').onChange((v) => {
+    pathUniforms.uPathNoiseScale.value = v;
+});
+terrainFolder.add(params, 'pathSparseness', 0, 1, 0.01).name('path sparseness').onChange((v) => {
+    pathUniforms.uPathSparseness.value = v;
 });
 
 const treeFolder = gui.addFolder('Trees');
