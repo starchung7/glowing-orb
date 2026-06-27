@@ -147,7 +147,8 @@ const params = {
     orbRadius: 0.008,
     orbLightIntensity: 1.5,
     orbLightColor: '#ccccff',
-    shadowsEnabled: false,
+    sceneShadowsEnabled: false, // terrain / boxes / trees cast + receive shadows
+    grassShadowsEnabled: false, // grass casts + receives shadows
     moveSpeed: 2.5,
     accelRate: 4,
     jumpThrustAccel: 30,
@@ -1246,8 +1247,8 @@ function buildTrees() {
     // the model so multi-part trees (trunk + leaves) reconstruct correctly.
     for (const { geometry, material, matrix } of treeSources) {
         const inst = new THREE.InstancedMesh(geometry, material, count);
-        inst.castShadow = true;
-        inst.receiveShadow = true;
+        inst.castShadow = params.sceneShadowsEnabled;
+        inst.receiveShadow = params.sceneShadowsEnabled;
         inst.frustumCulled = false; // instances span the whole area; skip culling
         for (let i = 0; i < count; i++) {
             _treeFinal.multiplyMatrices(instances[i], matrix);
@@ -1427,15 +1428,37 @@ const targetVelocity = new THREE.Vector3();
 
 // Flip the whole shadow pipeline on/off: the orb stops rendering its depth cube
 // (so nothing casts), and the grass falls back to fully-lit receiving.
-function applyShadowsEnabled(v) {
-    orbLight.castShadow = v;
+// The orb light only needs to render its (expensive) shadow cube if either the
+// scene or the grass is actually using shadows — skip it entirely when both off.
+function updateOrbShadowCaster() {
+    orbLight.castShadow =
+        params.sceneShadowsEnabled || params.grassShadowsEnabled;
+}
+
+// Scene shadows: terrain, boxes, and trees cast onto / receive from each other.
+function applySceneShadows(v) {
+    terrainMesh.traverse((o) => {
+        if (o.isMesh) { o.castShadow = v; o.receiveShadow = v; }
+    });
+    for (const { mesh } of boxes) { mesh.castShadow = v; mesh.receiveShadow = v; }
+    for (const inst of treeGroup.children) {
+        inst.castShadow = v; inst.receiveShadow = v;
+    }
+    updateOrbShadowCaster();
+}
+
+// Grass shadows: blades cast into the shadow cube and sample it to self-shadow.
+function applyGrassShadows(v) {
     grass.castShadow = v;
     grassMaterial.uniforms.uShadowEnabled.value = v ? 1 : 0;
     if (!v) grassMaterial.uniforms.uShadowMap.value = grassShadowFallback;
+    updateOrbShadowCaster();
 }
-// Apply the initial shadow state so the default (off) takes effect at startup,
+
+// Apply the initial shadow state so the defaults take effect at startup,
 // overriding the castShadow=true flags set when each object was created.
-applyShadowsEnabled(params.shadowsEnabled);
+applySceneShadows(params.sceneShadowsEnabled);
+applyGrassShadows(params.grassShadowsEnabled);
 
 // --- Live controls (lil-gui) ---
 const gui = new GUI({ title: 'Controls' });
@@ -1449,7 +1472,10 @@ orbFolder.add(orbLight, 'intensity', 0, 5, 0.1).name('light intensity');
 orbFolder.add(orbLight, 'distance', 0.5, 8, 0.1).name('light distance');
 orbFolder.addColor(params, 'orbLightColor').name('light color')
     .onChange((v) => orbLight.color.set(v));
-orbFolder.add(params, 'shadowsEnabled').name('shadows').onChange(applyShadowsEnabled);
+orbFolder.add(params, 'sceneShadowsEnabled').name('scene shadows')
+    .onChange(applySceneShadows);
+orbFolder.add(params, 'grassShadowsEnabled').name('grass shadows')
+    .onChange(applyGrassShadows);
 
 const lightingFolder = gui.addFolder('Lighting');
 lightingFolder.add(ambientLight, 'intensity', 0, 1, 0.01).name('ambient');
@@ -1751,7 +1777,7 @@ function animate() {
 
     // Hand the grass the orb light's live point-shadow cube + parameters so it
     // can receive shadows, and keep the caster's distance reference in sync.
-    if (params.shadowsEnabled && orbLight.shadow.map) {
+    if (params.grassShadowsEnabled && orbLight.shadow.map) {
         gu.uShadowMap.value = orbLight.shadow.map.texture;
     }
     gu.uShadowMapSize.value.copy(orbLight.shadow.mapSize);
