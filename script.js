@@ -178,7 +178,7 @@ const params = {
     grassWidth: 0.04,         // blade base half-width
     terrainColor: '#26242e',  // default terrain tint, applied to the model's material after load
     pathEnabled: true,        // paint path.png onto the feature map's red areas
-    pathTiling: 14,           // how many times the path texture repeats across the terrain
+    pathTiling: 28,           // how many times the path texture repeats across the terrain
     pathTint: '#ffffff',      // multiplier tint applied to the path texture
     grassColorBase: '#342b4a',// shaded blade base
     grassColorTip: '#615c7a', // lit blade tip
