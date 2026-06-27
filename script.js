@@ -583,9 +583,12 @@ function updateTrail(dt) {
     trailMesh.visible = true;
 }
 
-// Subtle ambient + hemisphere fill so the floor isn't pitch black everywhere
-scene.add(new THREE.AmbientLight(0xffffff, 0.0));
-scene.add(new THREE.HemisphereLight(0xffffff, 0x101010, 0.0));
+// Subtle ambient + hemisphere fill so the floor isn't pitch black everywhere.
+// Kept as references so the GUI can tune their intensities live.
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.08);
+scene.add(ambientLight);
+const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x101010, 0.15);
+scene.add(hemisphereLight);
 
 // Floating dust particles — a single GPU point cloud (one draw call) whose
 // brightness reacts to the orb's light. Lighting and drift are computed in the
@@ -1447,6 +1450,10 @@ orbFolder.add(orbLight, 'distance', 0.5, 8, 0.1).name('light distance');
 orbFolder.addColor(params, 'orbLightColor').name('light color')
     .onChange((v) => orbLight.color.set(v));
 orbFolder.add(params, 'shadowsEnabled').name('shadows').onChange(applyShadowsEnabled);
+
+const lightingFolder = gui.addFolder('Lighting');
+lightingFolder.add(ambientLight, 'intensity', 0, 1, 0.01).name('ambient');
+lightingFolder.add(hemisphereLight, 'intensity', 0, 1, 0.01).name('hemisphere');
 
 const moveFolder = gui.addFolder('Movement');
 moveFolder.add(params, 'moveSpeed', 0.5, 6, 0.1).name('speed');
