@@ -341,19 +341,24 @@ function syncComposerSize() {
 }
 syncComposerSize();
 
-// Rolling terrain ground (from terrain.glb), replacing the old flat plane. The
-// mesh keeps its Blender-authored "terrain" material; enable dithering on it to
-// avoid colour banding in the dark terrain-to-fog gradient.
+// Rolling terrain ground (from terrain.glb), replacing the old flat plane.
+// Swap the GLB's Blender-authored material for a stock THREE.MeshStandardMaterial
+// (Three's defaults: white, roughness 1, metalness 0). Dithering is enabled to
+// avoid colour banding in the dark terrain-to-fog gradient, and the colour is
+// tinted below from params.terrainColor.
 const terrainMaterials = []; // collected so the GUI can recolour the terrain
 terrainMesh.traverse((o) => {
     if (o.isMesh && o.material) {
         o.castShadow = true;    // hills shadow the grass / each other
         o.receiveShadow = true; // the ground catches the orb's cast shadows
-        const mats = Array.isArray(o.material) ? o.material : [o.material];
-        for (const mat of mats) {
-            mat.dithering = true;
-            terrainMaterials.push(mat);
+        // Dispose the authored material(s) we're replacing to free GPU resources.
+        for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
+            m.dispose();
         }
+        const mat = new THREE.MeshStandardMaterial();
+        mat.dithering = true;
+        o.material = mat;
+        terrainMaterials.push(mat);
     }
 });
 scene.add(terrainMesh);
