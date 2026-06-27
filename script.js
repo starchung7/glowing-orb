@@ -147,7 +147,7 @@ const params = {
     orbRadius: 0.008,
     orbLightIntensity: 1.5,
     orbLightColor: '#ccccff',
-    shadowsEnabled: true,
+    shadowsEnabled: false,
     moveSpeed: 2.5,
     accelRate: 4,
     jumpThrustAccel: 30,
@@ -173,9 +173,10 @@ const params = {
     grassDensity: isTouchDevice ? 700 : 1400, // patch subdivisions per axis
     grassHeight: 0.26,        // blade height (scene is small-scale)
     grassWidth: 0.04,         // blade base half-width
+    terrainColor: '#26242e',  // default terrain tint, applied to the model's material after load
     grassColorBase: '#342b4a',// shaded blade base
     grassColorTip: '#615c7a', // lit blade tip
-    grassWindStrength: 0.4,   // sway amplitude
+    grassWindStrength: 0.9,   // sway amplitude
     grassLightRange: 4.0,     // how far the orb glow reaches the grass
     // Light repulsor: the orb's light shoves nearby blade apexes away from it,
     // logarithmic falloff out to grassRepulsorRadius, diminished as the light
@@ -340,15 +341,23 @@ syncComposerSize();
 // Rolling terrain ground (from terrain.glb), replacing the old flat plane. The
 // mesh keeps its Blender-authored "terrain" material; enable dithering on it to
 // avoid colour banding in the dark terrain-to-fog gradient.
+const terrainMaterials = []; // collected so the GUI can recolour the terrain
 terrainMesh.traverse((o) => {
     if (o.isMesh && o.material) {
         o.castShadow = true;    // hills shadow the grass / each other
         o.receiveShadow = true; // the ground catches the orb's cast shadows
         const mats = Array.isArray(o.material) ? o.material : [o.material];
-        for (const mat of mats) mat.dithering = true;
+        for (const mat of mats) {
+            mat.dithering = true;
+            terrainMaterials.push(mat);
+        }
     }
 });
 scene.add(terrainMesh);
+
+// Apply the default terrain colour to the authored material(s) so the scene
+// opens on it. The GUI picker (seeded from the same param) tweaks it live.
+for (const mat of terrainMaterials) if (mat.color) mat.color.set(params.terrainColor);
 
 // Tiny glowing orb — same radius as the trail tube so they sit flush
 const orb = new THREE.Mesh(
@@ -1421,6 +1430,9 @@ function applyShadowsEnabled(v) {
     grassMaterial.uniforms.uShadowEnabled.value = v ? 1 : 0;
     if (!v) grassMaterial.uniforms.uShadowMap.value = grassShadowFallback;
 }
+// Apply the initial shadow state so the default (off) takes effect at startup,
+// overriding the castShadow=true flags set when each object was created.
+applyShadowsEnabled(params.shadowsEnabled);
 
 // --- Live controls (lil-gui) ---
 const gui = new GUI({ title: 'Controls' });
@@ -1510,6 +1522,11 @@ grassFolder.addColor(params, 'grassColorBase').name('base color')
     .onChange((v) => grassMaterial.uniforms.uColorBase.value.set(v));
 grassFolder.addColor(params, 'grassColorTip').name('tip color')
     .onChange((v) => grassMaterial.uniforms.uColorTip.value.set(v));
+
+const terrainFolder = gui.addFolder('Terrain');
+terrainFolder.addColor(params, 'terrainColor').name('color').onChange((v) => {
+    for (const mat of terrainMaterials) if (mat.color) mat.color.set(v);
+});
 
 const treeFolder = gui.addFolder('Trees');
 // Each of these reshuffles the scatter, so rebuild only when the slider settles.
