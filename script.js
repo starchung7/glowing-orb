@@ -10,6 +10,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import treeUrl from './assets/models/tree1.glb?url';
 import terrainUrl from './assets/models/terrain.glb?url';
 import featureMapUrl from './assets/terrain.png?url';
+import pathMapUrl from './assets/path.png?url';
 
 await RAPIER.init();
 
@@ -176,6 +177,9 @@ const params = {
     grassHeight: 0.26,        // blade height (scene is small-scale)
     grassWidth: 0.04,         // blade base half-width
     terrainColor: '#26242e',  // default terrain tint, applied to the model's material after load
+    pathEnabled: true,        // paint path.png onto the feature map's red areas
+    pathTiling: 14,           // how many times the path texture repeats across the terrain
+    pathTint: '#ffffff',      // multiplier tint applied to the path texture
     grassColorBase: '#342b4a',// shaded blade base
     grassColorTip: '#615c7a', // lit blade tip
     grassFeatureMaskEnabled: true, // restrict grass to the feature map's green areas
@@ -346,6 +350,81 @@ syncComposerSize();
 // (cheap non-PBR diffuse shading). Dithering is enabled to avoid colour banding
 // in the dark terrain-to-fog gradient, and the colour is tinted below from
 // params.terrainColor.
+// Path texturing: where the feature map's red channel dominates, the terrain is
+// painted with the tiling path.png cobblestone texture instead of the flat tint.
+// Both the feature map and the path texture are sampled in the terrain material's
+// fragment shader (injected via onBeforeCompile), using the same XZ→feature UV
+// mapping the grass shader uses so paths line up exactly with the grass cutouts.
+const terrainFeatureMap = new THREE.TextureLoader().load(featureMapUrl);
+terrainFeatureMap.colorSpace = THREE.NoColorSpace;
+terrainFeatureMap.wrapS = THREE.ClampToEdgeWrapping;
+terrainFeatureMap.wrapT = THREE.ClampToEdgeWrapping;
+terrainFeatureMap.minFilter = THREE.LinearFilter;
+terrainFeatureMap.magFilter = THREE.LinearFilter;
+terrainFeatureMap.flipY = false;
+
+const pathTexture = new THREE.TextureLoader().load(pathMapUrl);
+pathTexture.colorSpace = THREE.SRGBColorSpace;
+pathTexture.wrapS = THREE.RepeatWrapping;
+pathTexture.wrapT = THREE.RepeatWrapping;
+
+// Shared uniform objects so the GUI can tweak the path live across every
+// terrain sub-material (they all reference the same value objects).
+const pathUniforms = {
+    uPathMap: { value: pathTexture },
+    uPathFeatureMap: { value: terrainFeatureMap },
+    uPathTerrainMin: { value: new THREE.Vector2(TERRAIN_MIN_X, TERRAIN_MIN_Z) },
+    uPathTerrainSize: { value: new THREE.Vector2(TERRAIN_SIZE_X, TERRAIN_SIZE_Z) },
+    uPathTiling: { value: params.pathTiling },
+    uPathEnabled: { value: params.pathEnabled ? 1 : 0 },
+    uPathTint: { value: new THREE.Color(params.pathTint) },
+};
+
+function applyPathShader(mat) {
+    mat.onBeforeCompile = (shader) => {
+        Object.assign(shader.uniforms, pathUniforms);
+
+        shader.vertexShader = shader.vertexShader
+            .replace(
+                '#include <common>',
+                '#include <common>\nvarying vec3 vPathWorld;',
+            )
+            .replace(
+                '#include <begin_vertex>',
+                '#include <begin_vertex>\nvPathWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;',
+            );
+
+        shader.fragmentShader = shader.fragmentShader
+            .replace(
+                '#include <common>',
+                `#include <common>
+                varying vec3 vPathWorld;
+                uniform sampler2D uPathMap;
+                uniform sampler2D uPathFeatureMap;
+                uniform vec2 uPathTerrainMin;
+                uniform vec2 uPathTerrainSize;
+                uniform float uPathTiling;
+                uniform float uPathEnabled;
+                uniform vec3 uPathTint;`,
+            )
+            .replace(
+                'vec4 diffuseColor = vec4( diffuse, opacity );',
+                `vec4 diffuseColor = vec4( diffuse, opacity );
+                if (uPathEnabled > 0.5) {
+                    vec2 featUV = (vPathWorld.xz - uPathTerrainMin) / uPathTerrainSize;
+                    vec3 fc = texture2D(uPathFeatureMap, featUV).rgb;
+                    float redness = fc.r - max(fc.g, fc.b);
+                    float inside = step(0.0, featUV.x) * step(featUV.x, 1.0) *
+                                   step(0.0, featUV.y) * step(featUV.y, 1.0);
+                    float pathMask = smoothstep(0.02, 0.25, redness) * inside;
+                    vec3 pathCol = texture2D(uPathMap, featUV * uPathTiling).rgb * uPathTint;
+                    diffuseColor.rgb = mix(diffuseColor.rgb, pathCol, pathMask);
+                }`,
+            );
+    };
+    mat.needsUpdate = true;
+}
+
 const terrainMaterials = []; // collected so the GUI can recolour the terrain
 terrainMesh.traverse((o) => {
     if (o.isMesh && o.material) {
@@ -357,6 +436,7 @@ terrainMesh.traverse((o) => {
         }
         const mat = new THREE.MeshLambertMaterial();
         mat.dithering = true;
+        applyPathShader(mat);
         o.material = mat;
         terrainMaterials.push(mat);
     }
@@ -1606,6 +1686,15 @@ grassFolder.addColor(params, 'grassColorTip').name('tip color')
 const terrainFolder = gui.addFolder('Terrain');
 terrainFolder.addColor(params, 'terrainColor').name('color').onChange((v) => {
     for (const mat of terrainMaterials) if (mat.color) mat.color.set(v);
+});
+terrainFolder.add(params, 'pathEnabled').name('paths (red mask)').onChange((v) => {
+    pathUniforms.uPathEnabled.value = v ? 1 : 0;
+});
+terrainFolder.add(params, 'pathTiling', 1, 60, 1).name('path tiling').onChange((v) => {
+    pathUniforms.uPathTiling.value = v;
+});
+terrainFolder.addColor(params, 'pathTint').name('path tint').onChange((v) => {
+    pathUniforms.uPathTint.value.set(v);
 });
 
 const treeFolder = gui.addFolder('Trees');
