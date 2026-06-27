@@ -9,6 +9,7 @@ import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import treeUrl from './assets/models/tree1.glb?url';
 import terrainUrl from './assets/models/terrain.glb?url';
+import featureMapUrl from './assets/terrain.png?url';
 
 await RAPIER.init();
 
@@ -177,6 +178,7 @@ const params = {
     terrainColor: '#26242e',  // default terrain tint, applied to the model's material after load
     grassColorBase: '#342b4a',// shaded blade base
     grassColorTip: '#615c7a', // lit blade tip
+    grassFeatureMaskEnabled: true, // restrict grass to the feature map's green areas
     grassWindStrength: 0.9,   // sway amplitude
     grassLightRange: 4.0,     // how far the orb glow reaches the grass
     // Light repulsor: the orb's light shoves nearby blade apexes away from it,
@@ -821,6 +823,20 @@ const grassShadowFallback = new THREE.DataTexture(
 );
 grassShadowFallback.needsUpdate = true;
 
+// Feature map (terrain.png): an authoring reference whose channels mark where
+// scene features live — red = paths, blue = water, green = grass. It maps onto
+// the same XZ region as the terrain heightmap, so the grass shader can sample it
+// (NoColorSpace → read raw channel values, not gamma-decoded) and grow blades
+// only where green is the dominant channel. flipY=false matches the heightmap's
+// bottom-up row convention; if the orientation looks mirrored we just flip this.
+const featureMap = new THREE.TextureLoader().load(featureMapUrl);
+featureMap.colorSpace = THREE.NoColorSpace;
+featureMap.wrapS = THREE.ClampToEdgeWrapping;
+featureMap.wrapT = THREE.ClampToEdgeWrapping;
+featureMap.minFilter = THREE.LinearFilter;
+featureMap.magFilter = THREE.LinearFilter;
+featureMap.flipY = false;
+
 // Shared vertex-stage code for the grass. Both the visible material and the
 // shadow (customDistance) material run the EXACT same displacement — cone shape,
 // infinite tiling, terrain conform, height, wind and the light repulsor — so the
@@ -857,6 +873,8 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
     uniform vec2 uTerrainSize;
     uniform float uHeightMin;
     uniform float uHeightRange;
+    uniform sampler2D uFeatureMap;  // RGB authoring mask: green channel = grass
+    uniform float uFeatureMaskEnabled;
 
     vec2 windOffset(vec2 p) {
         vec2 rp = p * uWindFreq;
@@ -928,6 +946,21 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
             }
         }
 
+        // Feature map: only grow grass where green dominates (paths=red,
+        // water=blue, outlines=black are all excluded). Collapse masked-out
+        // blades to their ground point so the whole triangle has zero area and
+        // is never rasterised — cheaper and cleaner than a fragment discard, and
+        // it works identically in the shadow pass so cast shadows match.
+        if (uFeatureMaskEnabled > 0.5) {
+            vec2 fUV = (bladeXZ - uTerrainMin) / uTerrainSize;
+            float inside = step(0.0, fUV.x) * step(fUV.x, 1.0) *
+                           step(0.0, fUV.y) * step(fUV.y, 1.0);
+            vec3 fc = texture(uFeatureMap, fUV).rgb;
+            float greenness = fc.g - max(fc.r, fc.b);
+            float keep = smoothstep(0.02, 0.18, greenness) * inside;
+            vertPos = mix(ground, vertPos, keep);
+        }
+
         vWorldOut = (modelMatrix * vec4(vertPos, 1.0)).xyz;
         vTipOut = tip;
         return vertPos;
@@ -969,6 +1002,9 @@ const grassMaterial = new THREE.RawShaderMaterial({
         uTerrainSize: { value: new THREE.Vector2(TERRAIN_SIZE_X, TERRAIN_SIZE_Z) },
         uHeightMin: { value: TERRAIN_HEIGHT_MIN },
         uHeightRange: { value: TERRAIN_HEIGHT_RANGE },
+        // Feature map (green channel) restricts grass to the painted grass areas.
+        uFeatureMap: { value: featureMap },
+        uFeatureMaskEnabled: { value: params.grassFeatureMaskEnabled ? 1 : 0 },
         // Point-light shadow receiving (manually wired — RawShaderMaterial is
         // invisible to three's automatic shadow plumbing).
         uShadowEnabled: { value: 1 },
@@ -1133,6 +1169,8 @@ const grassDistanceMaterial = new THREE.RawShaderMaterial({
         uTerrainSize: gu.uTerrainSize,
         uHeightMin: gu.uHeightMin,
         uHeightRange: gu.uHeightRange,
+        uFeatureMap: gu.uFeatureMap,
+        uFeatureMaskEnabled: gu.uFeatureMaskEnabled,
         // Set per frame to the light position + shadow camera near/far so the
         // packed distance matches what the rest of the scene writes.
         uRefPosition: { value: new THREE.Vector3() },
@@ -1532,6 +1570,10 @@ fogFolder.add(params, 'fogDensity', 0, 0.15, 0.002).name('fog density')
 
 const grassFolder = gui.addFolder('Grass');
 // Density rebuilds the geometry, so only do it when the slider is released.
+grassFolder.add(params, 'grassFeatureMaskEnabled').name('mask to green')
+    .onChange((v) => {
+        grassMaterial.uniforms.uFeatureMaskEnabled.value = v ? 1 : 0;
+    });
 grassFolder.add(params, 'grassDensity', 120, 1400, 20).name('density')
     .onFinishChange((v) => {
         grass.geometry.dispose();
