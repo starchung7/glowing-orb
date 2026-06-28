@@ -149,7 +149,7 @@ const params = {
     orbRadius: 0.008,
     orbLightIntensity: 1.5,
     orbLightColor: '#ccccff',
-    sceneShadowsEnabled: false, // terrain / boxes / trees cast + receive shadows
+    sceneShadowsEnabled: true, // terrain / boxes / trees cast + receive shadows
     grassShadowsEnabled: false, // grass casts + receives shadows
     moveSpeed: 2.5,
     accelRate: 4,
@@ -180,7 +180,7 @@ const params = {
     pathEnabled: true,        // paint path.png onto the feature map's red areas
     pathTiling: 28,           // how many times the path texture repeats across the terrain
     pathTint: '#ffffff',      // multiplier tint applied to the path texture
-    pathOpacity: 0.4,         // how strongly the path texture overrides the terrain
+    pathOpacity: 0.2,         // how strongly the path texture overrides the terrain
     // Patchiness: FBM noise erodes the path so it reads as old / unkempt, with
     // bare ground showing through irregular gaps in the cobbles.
     pathPatchiness: 1.0,      // 0 = solid path, 1 = fully noise-eroded
