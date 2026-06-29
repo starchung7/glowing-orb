@@ -190,8 +190,8 @@ const params = {
     grassColorBase: '#342b4a',// shaded blade base
     grassColorTip: '#615c7a', // lit blade tip
     grassFeatureMaskEnabled: true, // restrict grass to the feature map's green areas
-    grassEdgeSoftness: 1.0,   // rim width in feature-map texels: blades this close to an edge shrink
-    grassEdgeShrink: 0.4,     // height multiplier applied to the rim row (1 = no change)
+    grassEdgeSoftness: 3.0,   // rim ramp width in feature-map texels: rows over which height climbs to full
+    grassEdgeShrink: 0.4,     // height multiplier applied to the outermost rim row (1 = no change)
     grassWindStrength: 0.9,   // sway amplitude
     grassLightRange: 4.0,     // how far the orb glow reaches the grass
     // Light repulsor: the orb's light shoves nearby blade apexes away from it,
@@ -1013,7 +1013,7 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
     uniform float uHeightRange;
     uniform sampler2D uFeatureMap;  // RGB authoring mask: green channel = grass
     uniform float uFeatureMaskEnabled;
-    uniform float uEdgeSoftness;    // rim width in feature-map texels
+    uniform float uEdgeSoftness;    // rim ramp width in feature-map texels
     uniform float uEdgeShrink;      // height multiplier for the rim row
 
     vec2 windOffset(vec2 p) {
@@ -1103,25 +1103,43 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
                            step(0.0, fUV.y) * step(fUV.y, 1.0);
             // Grass exists only where the blade's own texel is green.
             float here = smoothstep(0.02, 0.18, grassGreen(fUV));
-            // Rim detection: a blade is on the rim only if at least one neighbour
-            // one row out (radius = uEdgeSoftness, measured in feature-map texels)
-            // is non-green. We take the min greenness over the 8 neighbours — if
-            // any is non-green the min drops below the threshold and the blade is
-            // flagged as rim. Only those rim blades get their height scaled by
-            // uEdgeShrink; every interior blade (all neighbours green) keeps full
-            // height. Sampling in texels keeps the rim a single mask cell thick
-            // regardless of world scale.
-            vec2 r = (1.0 / vec2(textureSize(uFeatureMap, 0))) * uEdgeSoftness;
-            float gmin = grassGreen(fUV + vec2( r.x, 0.0));
-            gmin = min(gmin, grassGreen(fUV + vec2(-r.x, 0.0)));
-            gmin = min(gmin, grassGreen(fUV + vec2(0.0,  r.y)));
-            gmin = min(gmin, grassGreen(fUV + vec2(0.0, -r.y)));
-            gmin = min(gmin, grassGreen(fUV + vec2( r.x,  r.y)));
-            gmin = min(gmin, grassGreen(fUV + vec2(-r.x,  r.y)));
-            gmin = min(gmin, grassGreen(fUV + vec2( r.x, -r.y)));
-            gmin = min(gmin, grassGreen(fUV + vec2(-r.x, -r.y)));
-            float rim = 1.0 - step(0.1, gmin);            // 1 if any neighbour non-green
-            float heightFactor = mix(1.0, uEdgeShrink, rim);
+            // Graduated rim: find how many feature-map texels this blade sits from
+            // the nearest non-green texel, then ramp its height from uEdgeShrink at
+            // the outermost row up to full over uEdgeSoftness rows. So the very
+            // edge row is shortest, the next row a little taller, and so on until
+            // the interior reaches full height. Distance is measured by the min
+            // greenness over 8 neighbours at each ring (every edge type counts
+            // equally), and we cheaply skip the per-ring search for blades whose
+            // ring at the max radius is still fully green (i.e. true interior).
+            vec2 texel = 1.0 / vec2(textureSize(uFeatureMap, 0));
+            float heightFactor = 1.0;
+            vec2 rmax = texel * uEdgeSoftness;
+            float gOuter = grassGreen(fUV + vec2( rmax.x, 0.0));
+            gOuter = min(gOuter, grassGreen(fUV + vec2(-rmax.x, 0.0)));
+            gOuter = min(gOuter, grassGreen(fUV + vec2(0.0,  rmax.y)));
+            gOuter = min(gOuter, grassGreen(fUV + vec2(0.0, -rmax.y)));
+            gOuter = min(gOuter, grassGreen(fUV + rmax));
+            gOuter = min(gOuter, grassGreen(fUV - rmax));
+            gOuter = min(gOuter, grassGreen(fUV + vec2( rmax.x, -rmax.y)));
+            gOuter = min(gOuter, grassGreen(fUV + vec2(-rmax.x,  rmax.y)));
+            if (gOuter < 0.1) {
+                float dist = uEdgeSoftness;     // an edge is within the ramp band
+                for (int k = 1; k <= 8; k++) {
+                    if (float(k) > uEdgeSoftness) break;
+                    vec2 rr = texel * float(k);
+                    float gm = grassGreen(fUV + vec2( rr.x, 0.0));
+                    gm = min(gm, grassGreen(fUV + vec2(-rr.x, 0.0)));
+                    gm = min(gm, grassGreen(fUV + vec2(0.0,  rr.y)));
+                    gm = min(gm, grassGreen(fUV + vec2(0.0, -rr.y)));
+                    gm = min(gm, grassGreen(fUV + rr));
+                    gm = min(gm, grassGreen(fUV - rr));
+                    gm = min(gm, grassGreen(fUV + vec2( rr.x, -rr.y)));
+                    gm = min(gm, grassGreen(fUV + vec2(-rr.x,  rr.y)));
+                    if (gm < 0.1) { dist = float(k); break; }
+                }
+                float t = clamp((dist - 1.0) / max(uEdgeSoftness - 1.0, 1.0), 0.0, 1.0);
+                heightFactor = mix(uEdgeShrink, 1.0, t);
+            }
             float keep = here * inside * heightFactor;
             vertPos = mix(ground, vertPos, keep);
         }
@@ -1743,7 +1761,7 @@ grassFolder.add(params, 'grassFeatureMaskEnabled').name('mask to green')
     .onChange((v) => {
         grassMaterial.uniforms.uFeatureMaskEnabled.value = v ? 1 : 0;
     });
-grassFolder.add(params, 'grassEdgeSoftness', 0.5, 6, 0.5).name('edge rim (texels)')
+grassFolder.add(params, 'grassEdgeSoftness', 1, 8, 1).name('edge rim rows')
     .onChange((v) => {
         grassMaterial.uniforms.uEdgeSoftness.value = v;
     });
