@@ -196,6 +196,7 @@ const params = {
     grassEdgeSoftness: 3.0,   // rim ramp width in feature-map texels: rows over which height climbs to full
     grassEdgeShrink: 0.5,     // height multiplier applied to the outermost rim row (1 = no change)
     grassEdgeJitter: 0.35,    // per-blade height scatter on the rim so it blends in instead of a clean band
+    grassEdgeLighten: 0.05,   // how much lighter (toward white) the outermost edge grass is
     grassWindStrength: 0.9,   // sway amplitude
     grassLightRange: 4.0,     // how far the orb glow reaches the grass
     // Light repulsor: the orb's light shoves nearby blade apexes away from it,
@@ -937,12 +938,14 @@ function buildGrassGeometry(subdivisions) {
                 heightRand[v] = hr;
                 v++;
             }
-            // Three side faces, each spanning the apex and two adjacent base
-            // corners (winding doesn't matter — the material is DoubleSide).
+            // Three side faces, each spanning two adjacent base corners and the
+            // apex (winding doesn't matter — the material is DoubleSide). The apex
+            // is listed LAST in every face so it is the provoking vertex: a flat
+            // varying then carries the apex-only edge factor across the whole blade.
             const apex = base, b0 = base + 1, b1 = base + 2, b2 = base + 3;
-            index[f++] = apex; index[f++] = b0; index[f++] = b1;
-            index[f++] = apex; index[f++] = b1; index[f++] = b2;
-            index[f++] = apex; index[f++] = b2; index[f++] = b0;
+            index[f++] = b0; index[f++] = b1; index[f++] = apex;
+            index[f++] = b1; index[f++] = b2; index[f++] = apex;
+            index[f++] = b2; index[f++] = b0; index[f++] = apex;
         }
     }
     const geo = new THREE.BufferGeometry();
@@ -1049,7 +1052,8 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
         return g;
     }
 
-    vec3 grassVertex(out float vTipOut, out vec3 vWorldOut) {
+    vec3 grassVertex(out float vTipOut, out vec3 vWorldOut, out float vEdgeOut) {
+        vEdgeOut = 0.0;   // interior blades carry no edge tint
         // Cone blade corner: aCorner 0 = apex, 1..3 = the three base corners. A
         // per-blade yaw (from aHeightRand) spins the base triangle so the cones
         // don't all share the same orientation.
@@ -1154,6 +1158,7 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
                     }
                     float t = clamp((dist - 1.0) / max(uEdgeSoftness - 1.0, 1.0), 0.0, 1.0);
                     heightFactor = mix(uEdgeShrink, 1.0, t);
+                    vEdgeOut = 1.0 - t;   // 1 at the outermost row, fading to 0 inward
                     // Scatter each rim blade's height a little (strongest at the
                     // outer edge, fading to none in the interior) so the boundary
                     // reads as ragged grass instead of one clean, even band.
@@ -1218,6 +1223,7 @@ const grassMaterial = new THREE.RawShaderMaterial({
         uEdgeSoftness: { value: params.grassEdgeSoftness },
         uEdgeShrink: { value: params.grassEdgeShrink },
         uEdgeJitter: { value: params.grassEdgeJitter },
+        uEdgeLighten: { value: params.grassEdgeLighten },
         // Point-light shadow receiving (manually wired — RawShaderMaterial is
         // invisible to three's automatic shadow plumbing).
         uShadowEnabled: { value: 1 },
@@ -1232,14 +1238,17 @@ const grassMaterial = new THREE.RawShaderMaterial({
         out float vTip;
         out vec3 vWorldPos;
         out float vFogDist;
+        flat out float vEdge;
 
         void main() {
             float tip;
             vec3 wp;
-            vec3 vertPos = grassVertex(tip, wp);
+            float edge;
+            vec3 vertPos = grassVertex(tip, wp, edge);
             vTip = tip;
             vWorldPos = wp;
             vFogDist = distance(wp, cameraPosition);
+            vEdge = edge;
             gl_Position = projectionMatrix * modelViewMatrix * vec4(vertPos, 1.0);
         }
     `,
@@ -1249,10 +1258,12 @@ const grassMaterial = new THREE.RawShaderMaterial({
         in float vTip;
         in vec3 vWorldPos;
         in float vFogDist;
+        flat in float vEdge;
         out vec4 fragColor;
 
         uniform vec3 uColorBase;
         uniform vec3 uColorTip;
+        uniform float uEdgeLighten;
         uniform vec3 uAmbient;
         uniform vec3 uOrbPos;
         uniform vec3 uOrbColor;
@@ -1320,9 +1331,18 @@ const grassMaterial = new THREE.RawShaderMaterial({
         }
 
         void main() {
+            // Edge blades shift to a slightly brighter colour toward the masked
+            // boundary. Apply the lift to the base and tip colours BEFORE the
+            // root→tip gradient and AO, so each blade keeps its darker-base /
+            // lighter-tip falloff just in a brighter palette. vEdge is a flat,
+            // apex-sourced factor: 1 at the outermost row, fading to 0 inside.
+            float edgeAmt = vEdge * uEdgeLighten;
+            vec3 baseCol = mix(uColorBase, vec3(1.0), edgeAmt);
+            vec3 tipCol  = mix(uColorTip,  vec3(1.0), edgeAmt);
+
             // Base-darkening AO: dark at the root, full bright at the tip.
             float ao = mix(0.4, 1.0, vTip);
-            vec3 albedo = mix(uColorBase, uColorTip, vTip) * ao;
+            vec3 albedo = mix(baseCol, tipCol, vTip) * ao;
 
             // Flat up-normal lighting (blades lit like the ground, per the guide)
             // plus the orb's travelling glow as a local point light.
@@ -1400,7 +1420,8 @@ const grassDistanceMaterial = new THREE.RawShaderMaterial({
         void main() {
             float tip;
             vec3 wp;
-            vec3 vertPos = grassVertex(tip, wp);
+            float edge;
+            vec3 vertPos = grassVertex(tip, wp, edge);
             vWorldPosition = wp;
             gl_Position = projectionMatrix * modelViewMatrix * vec4(vertPos, 1.0);
         }
@@ -1802,6 +1823,10 @@ grassFolder.add(params, 'grassEdgeShrink', 0, 1, 0.01).name('edge height')
 grassFolder.add(params, 'grassEdgeJitter', 0, 1, 0.01).name('edge jitter')
     .onChange((v) => {
         grassMaterial.uniforms.uEdgeJitter.value = v;
+    });
+grassFolder.add(params, 'grassEdgeLighten', 0, 1, 0.01).name('edge lighten')
+    .onChange((v) => {
+        grassMaterial.uniforms.uEdgeLighten.value = v;
     });
 grassFolder.add(params, 'grassDensity', 120, 1400, 20).name('density')
     .onFinishChange((v) => {
