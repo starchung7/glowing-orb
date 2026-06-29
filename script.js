@@ -195,6 +195,7 @@ const params = {
     grassFeatureMaskEnabled: true, // restrict grass to the feature map's green areas
     grassEdgeSoftness: 3.0,   // rim ramp width in feature-map texels: rows over which height climbs to full
     grassEdgeShrink: 0.5,     // height multiplier applied to the outermost rim row (1 = no change)
+    grassEdgeJitter: 0.35,    // per-blade height scatter on the rim so it blends in instead of a clean band
     grassWindStrength: 0.9,   // sway amplitude
     grassLightRange: 4.0,     // how far the orb glow reaches the grass
     // Light repulsor: the orb's light shoves nearby blade apexes away from it,
@@ -1019,6 +1020,7 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
     uniform float uFeatureMaskEnabled;
     uniform float uEdgeSoftness;    // rim ramp width in feature-map texels
     uniform float uEdgeShrink;      // height multiplier for the rim row
+    uniform float uEdgeJitter;      // per-blade height scatter on the rim
 
     vec2 windOffset(vec2 p) {
         vec2 rp = p * uWindFreq;
@@ -1152,6 +1154,12 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
                     }
                     float t = clamp((dist - 1.0) / max(uEdgeSoftness - 1.0, 1.0), 0.0, 1.0);
                     heightFactor = mix(uEdgeShrink, 1.0, t);
+                    // Scatter each rim blade's height a little (strongest at the
+                    // outer edge, fading to none in the interior) so the boundary
+                    // reads as ragged grass instead of one clean, even band.
+                    heightFactor = clamp(
+                        heightFactor + (aHeightRand - 0.5) * uEdgeJitter * (1.0 - t),
+                        0.0, 1.0);
                 }
             }
 
@@ -1209,6 +1217,7 @@ const grassMaterial = new THREE.RawShaderMaterial({
         uFeatureMaskEnabled: { value: params.grassFeatureMaskEnabled ? 1 : 0 },
         uEdgeSoftness: { value: params.grassEdgeSoftness },
         uEdgeShrink: { value: params.grassEdgeShrink },
+        uEdgeJitter: { value: params.grassEdgeJitter },
         // Point-light shadow receiving (manually wired — RawShaderMaterial is
         // invisible to three's automatic shadow plumbing).
         uShadowEnabled: { value: 1 },
@@ -1378,6 +1387,7 @@ const grassDistanceMaterial = new THREE.RawShaderMaterial({
         uFeatureMaskEnabled: gu.uFeatureMaskEnabled,
         uEdgeSoftness: gu.uEdgeSoftness,
         uEdgeShrink: gu.uEdgeShrink,
+        uEdgeJitter: gu.uEdgeJitter,
         // Set per frame to the light position + shadow camera near/far so the
         // packed distance matches what the rest of the scene writes.
         uRefPosition: { value: new THREE.Vector3() },
@@ -1788,6 +1798,10 @@ grassFolder.add(params, 'grassEdgeSoftness', 1, 8, 1).name('edge rim rows')
 grassFolder.add(params, 'grassEdgeShrink', 0, 1, 0.01).name('edge height')
     .onChange((v) => {
         grassMaterial.uniforms.uEdgeShrink.value = v;
+    });
+grassFolder.add(params, 'grassEdgeJitter', 0, 1, 0.01).name('edge jitter')
+    .onChange((v) => {
+        grassMaterial.uniforms.uEdgeJitter.value = v;
     });
 grassFolder.add(params, 'grassDensity', 120, 1400, 20).name('density')
     .onFinishChange((v) => {
