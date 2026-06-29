@@ -532,10 +532,11 @@ scene.add(orb);
 const orbLight = new THREE.PointLight(params.orbLightColor, params.orbLightIntensity, 5.0, 2);
 // Omnidirectional depth-mapped shadow. A PointLight shadow renders the scene
 // into the six faces of a cube depth map; mapSize is the per-face resolution, so
-// 2048² gives 2048×2048 on each face (well above the 1024² minimum). The shadow
-// camera spans from just outside the orb to the edge of its light reach.
+// 1024² gives 1024×1024 on each face. Dropping from 2048² to 1024² cuts the
+// per-frame shadow rasterisation 4×. The shadow camera spans from just outside
+// the orb to the edge of its light reach.
 orbLight.castShadow = true;
-orbLight.shadow.mapSize.set(2048, 2048);
+orbLight.shadow.mapSize.set(1024, 1024);
 orbLight.shadow.camera.near = 0.02;
 orbLight.shadow.camera.far = 6;
 orbLight.shadow.bias = -0.002;
