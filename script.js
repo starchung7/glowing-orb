@@ -190,6 +190,8 @@ const params = {
     grassColorBase: '#342b4a',// shaded blade base
     grassColorTip: '#615c7a', // lit blade tip
     grassFeatureMaskEnabled: true, // restrict grass to the feature map's green areas
+    grassEdgeSoftness: 1.0,   // rim width in feature-map texels: blades this close to an edge shrink
+    grassEdgeShrink: 0.4,     // height multiplier applied to the rim row (1 = no change)
     grassWindStrength: 0.9,   // sway amplitude
     grassLightRange: 4.0,     // how far the orb glow reaches the grass
     // Light repulsor: the orb's light shoves nearby blade apexes away from it,
@@ -1011,12 +1013,20 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
     uniform float uHeightRange;
     uniform sampler2D uFeatureMap;  // RGB authoring mask: green channel = grass
     uniform float uFeatureMaskEnabled;
+    uniform float uEdgeSoftness;    // rim width in feature-map texels
+    uniform float uEdgeShrink;      // height multiplier for the rim row
 
     vec2 windOffset(vec2 p) {
         vec2 rp = p * uWindFreq;
         float n1 = texture(uNoise, rp * 0.2 + uWindDir * uTime).r - 0.5;
         float n2 = texture(uNoise, rp * 0.1 + uWindDir * (uTime * 0.2)).r - 0.5;
         return uWindDir * (n1 + n2) * uWindStrength;
+    }
+
+    // Greenness of the feature map at a UV: positive where grass should grow.
+    float grassGreen(vec2 uv) {
+        vec3 c = texture(uFeatureMap, uv).rgb;
+        return c.g - max(c.r, c.b);
     }
 
     vec3 grassVertex(out float vTipOut, out vec3 vWorldOut) {
@@ -1091,9 +1101,28 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
             vec2 fUV = (bladeXZ - uTerrainMin) / uTerrainSize;
             float inside = step(0.0, fUV.x) * step(fUV.x, 1.0) *
                            step(0.0, fUV.y) * step(fUV.y, 1.0);
-            vec3 fc = texture(uFeatureMap, fUV).rgb;
-            float greenness = fc.g - max(fc.r, fc.b);
-            float keep = smoothstep(0.02, 0.18, greenness) * inside;
+            // Grass exists only where the blade's own texel is green.
+            float here = smoothstep(0.02, 0.18, grassGreen(fUV));
+            // Rim detection: a blade is on the rim only if at least one neighbour
+            // one row out (radius = uEdgeSoftness, measured in feature-map texels)
+            // is non-green. We take the min greenness over the 8 neighbours — if
+            // any is non-green the min drops below the threshold and the blade is
+            // flagged as rim. Only those rim blades get their height scaled by
+            // uEdgeShrink; every interior blade (all neighbours green) keeps full
+            // height. Sampling in texels keeps the rim a single mask cell thick
+            // regardless of world scale.
+            vec2 r = (1.0 / vec2(textureSize(uFeatureMap, 0))) * uEdgeSoftness;
+            float gmin = grassGreen(fUV + vec2( r.x, 0.0));
+            gmin = min(gmin, grassGreen(fUV + vec2(-r.x, 0.0)));
+            gmin = min(gmin, grassGreen(fUV + vec2(0.0,  r.y)));
+            gmin = min(gmin, grassGreen(fUV + vec2(0.0, -r.y)));
+            gmin = min(gmin, grassGreen(fUV + vec2( r.x,  r.y)));
+            gmin = min(gmin, grassGreen(fUV + vec2(-r.x,  r.y)));
+            gmin = min(gmin, grassGreen(fUV + vec2( r.x, -r.y)));
+            gmin = min(gmin, grassGreen(fUV + vec2(-r.x, -r.y)));
+            float rim = 1.0 - step(0.1, gmin);            // 1 if any neighbour non-green
+            float heightFactor = mix(1.0, uEdgeShrink, rim);
+            float keep = here * inside * heightFactor;
             vertPos = mix(ground, vertPos, keep);
         }
 
@@ -1141,6 +1170,8 @@ const grassMaterial = new THREE.RawShaderMaterial({
         // Feature map (green channel) restricts grass to the painted grass areas.
         uFeatureMap: { value: featureMap },
         uFeatureMaskEnabled: { value: params.grassFeatureMaskEnabled ? 1 : 0 },
+        uEdgeSoftness: { value: params.grassEdgeSoftness },
+        uEdgeShrink: { value: params.grassEdgeShrink },
         // Point-light shadow receiving (manually wired — RawShaderMaterial is
         // invisible to three's automatic shadow plumbing).
         uShadowEnabled: { value: 1 },
@@ -1307,6 +1338,8 @@ const grassDistanceMaterial = new THREE.RawShaderMaterial({
         uHeightRange: gu.uHeightRange,
         uFeatureMap: gu.uFeatureMap,
         uFeatureMaskEnabled: gu.uFeatureMaskEnabled,
+        uEdgeSoftness: gu.uEdgeSoftness,
+        uEdgeShrink: gu.uEdgeShrink,
         // Set per frame to the light position + shadow camera near/far so the
         // packed distance matches what the rest of the scene writes.
         uRefPosition: { value: new THREE.Vector3() },
@@ -1709,6 +1742,14 @@ const grassFolder = gui.addFolder('Grass');
 grassFolder.add(params, 'grassFeatureMaskEnabled').name('mask to green')
     .onChange((v) => {
         grassMaterial.uniforms.uFeatureMaskEnabled.value = v ? 1 : 0;
+    });
+grassFolder.add(params, 'grassEdgeSoftness', 0.5, 6, 0.5).name('edge rim (texels)')
+    .onChange((v) => {
+        grassMaterial.uniforms.uEdgeSoftness.value = v;
+    });
+grassFolder.add(params, 'grassEdgeShrink', 0, 1, 0.01).name('edge height')
+    .onChange((v) => {
+        grassMaterial.uniforms.uEdgeShrink.value = v;
     });
 grassFolder.add(params, 'grassDensity', 120, 1400, 20).name('density')
     .onFinishChange((v) => {
