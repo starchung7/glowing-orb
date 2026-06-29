@@ -191,7 +191,7 @@ const params = {
     grassColorTip: '#615c7a', // lit blade tip
     grassFeatureMaskEnabled: true, // restrict grass to the feature map's green areas
     grassEdgeSoftness: 3.0,   // rim ramp width in feature-map texels: rows over which height climbs to full
-    grassEdgeShrink: 0.4,     // height multiplier applied to the outermost rim row (1 = no change)
+    grassEdgeShrink: 0.5,     // height multiplier applied to the outermost rim row (1 = no change)
     grassWindStrength: 0.9,   // sway amplitude
     grassLightRange: 4.0,     // how far the orb glow reaches the grass
     // Light repulsor: the orb's light shoves nearby blade apexes away from it,
@@ -1029,6 +1029,20 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
         return c.g - max(c.r, c.b);
     }
 
+    // Minimum greenness over the 8 neighbours on a ring of half-extent rr (UV).
+    // Used for edge distance: a ring is "at an edge" once its min drops non-green.
+    float ringMinGreen(vec2 uv, vec2 rr) {
+        float g =        grassGreen(uv + vec2( rr.x, 0.0));
+        g = min(g,       grassGreen(uv + vec2(-rr.x, 0.0)));
+        g = min(g,       grassGreen(uv + vec2(0.0,  rr.y)));
+        g = min(g,       grassGreen(uv + vec2(0.0, -rr.y)));
+        g = min(g,       grassGreen(uv + rr));
+        g = min(g,       grassGreen(uv - rr));
+        g = min(g,       grassGreen(uv + vec2( rr.x, -rr.y)));
+        g = min(g,       grassGreen(uv + vec2(-rr.x,  rr.y)));
+        return g;
+    }
+
     vec3 grassVertex(out float vTipOut, out vec3 vWorldOut) {
         // Cone blade corner: aCorner 0 = apex, 1..3 = the three base corners. A
         // per-blade yaw (from aHeightRand) spins the base triangle so the cones
@@ -1101,47 +1115,39 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
             vec2 fUV = (bladeXZ - uTerrainMin) / uTerrainSize;
             float inside = step(0.0, fUV.x) * step(fUV.x, 1.0) *
                            step(0.0, fUV.y) * step(fUV.y, 1.0);
-            // Grass exists only where the blade's own texel is green.
-            float here = smoothstep(0.02, 0.18, grassGreen(fUV));
-            // Graduated rim: find how many feature-map texels this blade sits from
-            // the nearest non-green texel, then ramp its height from uEdgeShrink at
-            // the outermost row up to full over uEdgeSoftness rows. So the very
-            // edge row is shortest, the next row a little taller, and so on until
-            // the interior reaches full height. Distance is measured by the min
-            // greenness over 8 neighbours at each ring (every edge type counts
-            // equally), and we cheaply skip the per-ring search for blades whose
-            // ring at the max radius is still fully green (i.e. true interior).
-            vec2 texel = 1.0 / vec2(textureSize(uFeatureMap, 0));
+            // Existence (cheap, runs on every vertex so the whole blade collapses
+            // together): grass only where the blade's own texel is green.
+            float exists = smoothstep(0.02, 0.18, grassGreen(fUV)) * inside;
+
+            // Graduated rim height (apex only — the result is identical for all 4
+            // verts but only scales the apex, so the costly edge search is skipped
+            // for the 3 base corners and for non-grass blades that collapse anyway).
+            // Walk out ring by ring to find the texel distance to the nearest
+            // non-green cell, then ramp height from uEdgeShrink at the outermost
+            // row up to full over uEdgeSoftness rows. A single ring sample at the
+            // max radius cheaply rejects true-interior blades before the loop.
             float heightFactor = 1.0;
-            vec2 rmax = texel * uEdgeSoftness;
-            float gOuter = grassGreen(fUV + vec2( rmax.x, 0.0));
-            gOuter = min(gOuter, grassGreen(fUV + vec2(-rmax.x, 0.0)));
-            gOuter = min(gOuter, grassGreen(fUV + vec2(0.0,  rmax.y)));
-            gOuter = min(gOuter, grassGreen(fUV + vec2(0.0, -rmax.y)));
-            gOuter = min(gOuter, grassGreen(fUV + rmax));
-            gOuter = min(gOuter, grassGreen(fUV - rmax));
-            gOuter = min(gOuter, grassGreen(fUV + vec2( rmax.x, -rmax.y)));
-            gOuter = min(gOuter, grassGreen(fUV + vec2(-rmax.x,  rmax.y)));
-            if (gOuter < 0.1) {
-                float dist = uEdgeSoftness;     // an edge is within the ramp band
-                for (int k = 1; k <= 8; k++) {
-                    if (float(k) > uEdgeSoftness) break;
-                    vec2 rr = texel * float(k);
-                    float gm = grassGreen(fUV + vec2( rr.x, 0.0));
-                    gm = min(gm, grassGreen(fUV + vec2(-rr.x, 0.0)));
-                    gm = min(gm, grassGreen(fUV + vec2(0.0,  rr.y)));
-                    gm = min(gm, grassGreen(fUV + vec2(0.0, -rr.y)));
-                    gm = min(gm, grassGreen(fUV + rr));
-                    gm = min(gm, grassGreen(fUV - rr));
-                    gm = min(gm, grassGreen(fUV + vec2( rr.x, -rr.y)));
-                    gm = min(gm, grassGreen(fUV + vec2(-rr.x,  rr.y)));
-                    if (gm < 0.1) { dist = float(k); break; }
+            if (tip > 0.5 && exists > 0.001) {
+                vec2 texel = 1.0 / vec2(textureSize(uFeatureMap, 0));
+                if (ringMinGreen(fUV, texel * uEdgeSoftness) < 0.1) {
+                    float dist = uEdgeSoftness;   // an edge is within the ramp band
+                    for (int k = 1; k <= 8; k++) {
+                        if (float(k) > uEdgeSoftness) break;
+                        if (ringMinGreen(fUV, texel * float(k)) < 0.1) {
+                            dist = float(k);
+                            break;
+                        }
+                    }
+                    float t = clamp((dist - 1.0) / max(uEdgeSoftness - 1.0, 1.0), 0.0, 1.0);
+                    heightFactor = mix(uEdgeShrink, 1.0, t);
                 }
-                float t = clamp((dist - 1.0) / max(uEdgeSoftness - 1.0, 1.0), 0.0, 1.0);
-                heightFactor = mix(uEdgeShrink, 1.0, t);
             }
-            float keep = here * inside * heightFactor;
-            vertPos = mix(ground, vertPos, keep);
+
+            // Scale the apex's offset (height + wind + repulsor) by the rim factor
+            // — a no-op for base corners, whose offset from ground is horizontal —
+            // then collapse the whole blade toward its ground point where masked.
+            vertPos = ground + (vertPos - ground) * heightFactor;
+            vertPos = mix(ground, vertPos, exists);
         }
 
         vWorldOut = (modelMatrix * vec4(vertPos, 1.0)).xyz;
