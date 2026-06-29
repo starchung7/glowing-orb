@@ -171,9 +171,9 @@ const params = {
     fogDensity: 0.086,
     dofBlur: 2.5,             // max edge blur radius (texels)
     dofStart: 0.45,           // where the blur begins (0 = center, 1 = corner)
-    // Density is the dominant cost: 1400² ≈ 2M blades (~6M verts, ~94 MB buffer)
-    // which low-memory mobile GPUs may fail to allocate, dropping the whole mesh.
-    grassDensity: isTouchDevice ? 700 : 1400, // patch subdivisions per axis
+    // Density is the dominant cost: 940² ≈ 880K blades (~3.5M verts, ~42 MB buffer);
+    // low-memory mobile GPUs may fail to allocate larger fields, dropping the mesh.
+    grassDensity: isTouchDevice ? 700 : 940, // patch subdivisions per axis
     grassHeight: 0.26,        // blade height (scene is small-scale)
     grassHeightVariation: 0.6,   // how strongly coherent noise drives blade height (0 = uniform)
     grassHeightNoiseScale: 0.06, // spatial frequency of the height-clump noise
@@ -742,7 +742,7 @@ const PARTICLE_COUNT = 600;
 const PARTICLE_AREA = 6;        // half-extent of the spawn volume in X/Z
 const PARTICLE_Y_MIN = 0.15;
 const PARTICLE_Y_MAX = 4.0;
-const PARTICLE_LIGHT_RANGE = 7.0; // how far the orb's glow reaches a particle
+const PARTICLE_LIGHT_RANGE = 5.0; // how far the orb's glow reaches a particle
 
 const particleGeo = new THREE.BufferGeometry();
 const pPositions = new Float32Array(PARTICLE_COUNT * 3);
