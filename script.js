@@ -175,6 +175,9 @@ const params = {
     // which low-memory mobile GPUs may fail to allocate, dropping the whole mesh.
     grassDensity: isTouchDevice ? 700 : 1400, // patch subdivisions per axis
     grassHeight: 0.26,        // blade height (scene is small-scale)
+    grassHeightVariation: 0.6,   // how strongly coherent noise drives blade height (0 = uniform)
+    grassHeightNoiseScale: 0.06, // spatial frequency of the height-clump noise
+    grassHeightRand: 0.3,        // extra per-blade height jitter on top of the noise
     grassWidth: 0.04,         // blade base half-width
     terrainColor: '#26242e',  // default terrain tint, applied to the model's material after load
     pathEnabled: true,        // paint path.png onto the feature map's red areas
@@ -999,6 +1002,7 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
     uniform float uBladeHeight;
     uniform float uHeightRand;
     uniform float uHeightNoiseScale;
+    uniform float uHeightVariation;
     uniform vec2 uWindDir;
     uniform float uWindStrength;
     uniform float uWindFreq;
@@ -1073,9 +1077,17 @@ const GRASS_VERTEX_HEAD = /* glsl */ `
         // test and skip it for 3/4 of the vertices.
         float height = 0.0;
         if (tip > 0.5) {
-            float hn = texture(uNoise, bladeXZ * uHeightNoiseScale).r + 0.5;
-            height = uBladeHeight *
-                (uHeightRand * aHeightRand + (1.0 - uHeightRand)) * hn;
+            // Spatially-coherent height field: a coarse octave forms broad clumps
+            // of taller/shorter grass while a finer octave keeps neighbouring
+            // blades from matching. Centred on 0 and scaled by uHeightVariation
+            // (0 = uniform), this is the primary driver of the height variety.
+            float coarse = texture(uNoise, bladeXZ * uHeightNoiseScale).r;
+            float fine   = texture(uNoise, bladeXZ * uHeightNoiseScale * 4.0 + 17.3).r;
+            float field  = mix(coarse, fine, 0.35);                 // ~[0,1]
+            float vary   = 1.0 + (field - 0.5) * 2.0 * uHeightVariation;
+            // A touch of pure per-blade randomness so clumps still read natural.
+            float jitter = mix(1.0 - uHeightRand, 1.0, aHeightRand);
+            height = uBladeHeight * max(vary * jitter, 0.05);
         }
 
         // The apex rises to 'height' above the centre; the three base corners sit
@@ -1168,8 +1180,9 @@ const grassMaterial = new THREE.RawShaderMaterial({
         uNoise: { value: grassNoise },
         uBladeWidth: { value: params.grassWidth },
         uBladeHeight: { value: params.grassHeight },
-        uHeightRand: { value: 0.6 },
-        uHeightNoiseScale: { value: 0.06 },
+        uHeightRand: { value: params.grassHeightRand },
+        uHeightNoiseScale: { value: params.grassHeightNoiseScale },
+        uHeightVariation: { value: params.grassHeightVariation },
         uWindDir: { value: new THREE.Vector2(Math.sin(grassWindAngle), Math.cos(grassWindAngle)) },
         uWindStrength: { value: params.grassWindStrength },
         uWindFreq: { value: 0.5 },
@@ -1348,6 +1361,7 @@ const grassDistanceMaterial = new THREE.RawShaderMaterial({
         uBladeHeight: gu.uBladeHeight,
         uHeightRand: gu.uHeightRand,
         uHeightNoiseScale: gu.uHeightNoiseScale,
+        uHeightVariation: gu.uHeightVariation,
         uWindDir: gu.uWindDir,
         uWindStrength: gu.uWindStrength,
         uWindFreq: gu.uWindFreq,
@@ -1782,6 +1796,12 @@ grassFolder.add(params, 'grassDensity', 120, 1400, 20).name('density')
     });
 grassFolder.add(params, 'grassHeight', 0.05, 0.6, 0.01).name('height')
     .onChange((v) => { grassMaterial.uniforms.uBladeHeight.value = v; });
+grassFolder.add(params, 'grassHeightVariation', 0, 1, 0.01).name('height variation')
+    .onChange((v) => { grassMaterial.uniforms.uHeightVariation.value = v; });
+grassFolder.add(params, 'grassHeightNoiseScale', 0.01, 0.4, 0.01).name('height noise scale')
+    .onChange((v) => { grassMaterial.uniforms.uHeightNoiseScale.value = v; });
+grassFolder.add(params, 'grassHeightRand', 0, 1, 0.01).name('height jitter')
+    .onChange((v) => { grassMaterial.uniforms.uHeightRand.value = v; });
 grassFolder.add(params, 'grassWidth', 0.005, 0.1, 0.005).name('width')
     .onChange((v) => { grassMaterial.uniforms.uBladeWidth.value = v; });
 grassFolder.add(params, 'grassWindStrength', 0, 1.5, 0.05).name('wind')
