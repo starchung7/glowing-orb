@@ -190,6 +190,7 @@ const params = {
     pathNoiseScale: 1.8,      // world-space frequency of the patch noise
     pathSparseness: 0.5,      // higher = sparser path (more ground shows through)
     pathSparseStrength: 0.0,  // path opacity inside the eroded gaps (0 = bare ground)
+    pathEdgeFade: 3.0,        // soften the path→terrain boundary over this many feature-map texels
     grassColorBase: '#342b4a',// shaded blade base
     grassColorTip: '#615c7a', // lit blade tip
     grassFeatureMaskEnabled: true, // restrict grass to the feature map's green areas
@@ -397,6 +398,7 @@ const pathUniforms = {
     uPathNoiseScale: { value: params.pathNoiseScale },
     uPathSparseness: { value: params.pathSparseness },
     uPathSparseStrength: { value: params.pathSparseStrength },
+    uPathEdgeFade: { value: params.pathEdgeFade },
 };
 
 function applyPathShader(mat) {
@@ -430,6 +432,13 @@ function applyPathShader(mat) {
                 uniform float uPathNoiseScale;
                 uniform float uPathSparseness;
                 uniform float uPathSparseStrength;
+                uniform float uPathEdgeFade;
+
+                // Red-channel path coverage at a feature-map UV, in [0,1].
+                float pathRed(vec2 uv) {
+                    vec3 fc = texture2D(uPathFeatureMap, uv).rgb;
+                    return smoothstep(0.02, 0.25, fc.r - max(fc.g, fc.b));
+                }
 
                 float pathHash21(vec2 p) {
                     p = fract(p * vec2(123.34, 345.45));
@@ -462,11 +471,18 @@ function applyPathShader(mat) {
                 `vec4 diffuseColor = vec4( diffuse, opacity );
                 if (uPathEnabled > 0.5) {
                     vec2 featUV = (vPathWorld.xz - uPathTerrainMin) / uPathTerrainSize;
-                    vec3 fc = texture2D(uPathFeatureMap, featUV).rgb;
-                    float redness = fc.r - max(fc.g, fc.b);
                     float inside = step(0.0, featUV.x) * step(featUV.x, 1.0) *
                                    step(0.0, featUV.y) * step(featUV.y, 1.0);
-                    float pathMask = smoothstep(0.02, 0.25, redness) * inside;
+                    // Soft edge: average the red coverage over a small cross so the
+                    // path→terrain boundary fades over uPathEdgeFade feature-map
+                    // texels instead of snapping across one (fade 0 = hard edge).
+                    vec2 fade = uPathEdgeFade / vec2(textureSize(uPathFeatureMap, 0));
+                    float cov = pathRed(featUV);
+                    cov += pathRed(featUV + vec2( fade.x, 0.0));
+                    cov += pathRed(featUV + vec2(-fade.x, 0.0));
+                    cov += pathRed(featUV + vec2(0.0,  fade.y));
+                    cov += pathRed(featUV + vec2(0.0, -fade.y));
+                    float pathMask = (cov / 5.0) * inside;
                     // Erode the path with FBM noise so it looks old / patchy.
                     float n = pathFbm(vPathWorld.xz * uPathNoiseScale);
                     float patchMask = smoothstep(uPathSparseness - 0.18, uPathSparseness + 0.18, n);
@@ -1873,6 +1889,9 @@ terrainFolder.addColor(params, 'pathTint').name('path tint').onChange((v) => {
 });
 terrainFolder.add(params, 'pathOpacity', 0, 1, 0.01).name('path opacity').onChange((v) => {
     pathUniforms.uPathOpacity.value = v;
+});
+terrainFolder.add(params, 'pathEdgeFade', 0, 12, 0.5).name('path edge fade').onChange((v) => {
+    pathUniforms.uPathEdgeFade.value = v;
 });
 terrainFolder.add(params, 'pathPatchiness', 0, 1, 0.01).name('path patchiness').onChange((v) => {
     pathUniforms.uPathPatchiness.value = v;
