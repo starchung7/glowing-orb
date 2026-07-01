@@ -191,6 +191,12 @@ const params = {
     pathSparseness: 0.5,      // higher = sparser path (more ground shows through)
     pathSparseStrength: 0.0,  // path opacity inside the eroded gaps (0 = bare ground)
     pathEdgeFade: 3.0,        // soften the path→terrain boundary over this many feature-map texels
+    // 4-octave fBm ("Perlin") mottling painted onto the bare terrain wherever the
+    // tiled path isn't covering it, for ground colour variation.
+    terrainNoiseEnabled: true,
+    terrainNoiseScale: 1.8,     // world-space frequency of the terrain noise
+    terrainNoiseContrast: 1.5,  // hardness of the light/dark mottling (1 = linear)
+    terrainNoiseStrength: 0.25, // brightness variation amount around the base tint
     grassColorBase: '#342b4a',// shaded blade base
     grassColorTip: '#615c7a', // lit blade tip
     grassFeatureMaskEnabled: true, // restrict grass to the feature map's green areas
@@ -399,6 +405,10 @@ const pathUniforms = {
     uPathSparseness: { value: params.pathSparseness },
     uPathSparseStrength: { value: params.pathSparseStrength },
     uPathEdgeFade: { value: params.pathEdgeFade },
+    uTerrainNoiseEnabled: { value: params.terrainNoiseEnabled ? 1 : 0 },
+    uTerrainNoiseScale: { value: params.terrainNoiseScale },
+    uTerrainNoiseContrast: { value: params.terrainNoiseContrast },
+    uTerrainNoiseStrength: { value: params.terrainNoiseStrength },
 };
 
 function applyPathShader(mat) {
@@ -433,6 +443,10 @@ function applyPathShader(mat) {
                 uniform float uPathSparseness;
                 uniform float uPathSparseStrength;
                 uniform float uPathEdgeFade;
+                uniform float uTerrainNoiseEnabled;
+                uniform float uTerrainNoiseScale;
+                uniform float uTerrainNoiseContrast;
+                uniform float uTerrainNoiseStrength;
 
                 // Red-channel path coverage at a feature-map UV, in [0,1].
                 float pathRed(vec2 uv) {
@@ -464,11 +478,23 @@ function applyPathShader(mat) {
                         amp *= 0.5;
                     }
                     return v;
+                }
+                // Ground-noise fBm: each octave steps up 4x in frequency.
+                float terrainFbm(vec2 p) {
+                    float v = 0.0;
+                    float amp = 0.5;
+                    for (int i = 0; i < 4; i++) {
+                        v += amp * pathVNoise(p);
+                        p *= 4.0;
+                        amp *= 0.5;
+                    }
+                    return v;
                 }`,
             )
             .replace(
                 'vec4 diffuseColor = vec4( diffuse, opacity );',
                 `vec4 diffuseColor = vec4( diffuse, opacity );
+                float tileAmount = 0.0; // how much tiled path covers this fragment
                 if (uPathEnabled > 0.5) {
                     vec2 featUV = (vPathWorld.xz - uPathTerrainMin) / uPathTerrainSize;
                     float inside = step(0.0, featUV.x) * step(featUV.x, 1.0) *
@@ -492,7 +518,16 @@ function applyPathShader(mat) {
                     float floorVal = mix(1.0, uPathSparseStrength, uPathPatchiness);
                     pathMask *= mix(floorVal, 1.0, patchMask);
                     vec3 pathCol = texture2D(uPathMap, featUV * uPathTiling).rgb * uPathTint;
-                    diffuseColor.rgb = mix(diffuseColor.rgb, pathCol, pathMask * uPathOpacity);
+                    tileAmount = pathMask * uPathOpacity;
+                    diffuseColor.rgb = mix(diffuseColor.rgb, pathCol, tileAmount);
+                }
+                // Perlin/fBm mottling on the bare ground (where no tiles cover it).
+                if (uTerrainNoiseEnabled > 0.5) {
+                    float tn = terrainFbm(vPathWorld.xz * uTerrainNoiseScale);
+                    // Recentre to [-0.5,0.5], push contrast, clamp back to [0,1].
+                    tn = clamp((tn - 0.5) * uTerrainNoiseContrast + 0.5, 0.0, 1.0);
+                    float m = 1.0 + (tn - 0.5) * 2.0 * uTerrainNoiseStrength;
+                    diffuseColor.rgb *= mix(1.0, m, 1.0 - tileAmount);
                 }`,
             );
     };
@@ -1905,6 +1940,18 @@ terrainFolder.add(params, 'pathSparseness', 0, 1, 0.01).name('path sparseness').
 });
 terrainFolder.add(params, 'pathSparseStrength', 0, 1, 0.01).name('sparse opacity').onChange((v) => {
     pathUniforms.uPathSparseStrength.value = v;
+});
+terrainFolder.add(params, 'terrainNoiseEnabled').name('ground noise').onChange((v) => {
+    pathUniforms.uTerrainNoiseEnabled.value = v ? 1 : 0;
+});
+terrainFolder.add(params, 'terrainNoiseScale', 0.1, 8, 0.1).name('noise scale').onChange((v) => {
+    pathUniforms.uTerrainNoiseScale.value = v;
+});
+terrainFolder.add(params, 'terrainNoiseContrast', 0.1, 6, 0.1).name('noise contrast').onChange((v) => {
+    pathUniforms.uTerrainNoiseContrast.value = v;
+});
+terrainFolder.add(params, 'terrainNoiseStrength', 0, 1, 0.01).name('noise strength').onChange((v) => {
+    pathUniforms.uTerrainNoiseStrength.value = v;
 });
 
 const treeFolder = gui.addFolder('Trees');
