@@ -335,17 +335,17 @@ const params = {
     // World-unit distance from shore over which the foam/ripple pattern plays
     // out (the shore-distance field saturates past it, keeping the middle
     // clear). Fixed in world units so band spacing is even along every shore.
-    waterShoreRange: 3.0,
+    waterShoreRange: 1.8,
     waterColor: '#000000',       // ripple band colour
     // Shore foam (layer 2): an irregular fringe hugging the waterline, its
     // outer edge displaced by drifting noise so it reads as lapping foam.
-    waterFoamColor: '#ffffff',
-    waterFoamWidth: 0.12,        // foam reach from the shore, in depth units
-    waterFoamNoiseFrequency: 1.5,// foam edge noise scale (world XZ multiplier)
-    waterFlowSpeed: 0.085,       // localTime advance per second
-    waterRipplesRatio: 0.41,     // 0..1 master fade (future weather hook)
-    waterSlopeFrequency: 10,     // number of bands across the depth range
-    waterNoiseFrequency: 0.785,  // wobble texture scale (world XZ multiplier)
+    waterFoamColor: '#000000',
+    waterFoamWidth: 0.19,        // foam reach from the shore, in shore-field units
+    waterFoamNoiseFrequency: 0.6,// foam edge noise scale (world XZ multiplier)
+    waterFlowSpeed: 0.03,        // localTime advance per second
+    waterRipplesRatio: 0.27,     // 0..1 master fade (future weather hook)
+    waterSlopeFrequency: 17,     // number of bands across the shore range
+    waterNoiseFrequency: 0.96,   // wobble texture scale (world XZ multiplier)
     waterNoiseOffset: 0.345,     // per-band noise offset divisor
 };
 
