@@ -342,6 +342,11 @@ const params = {
     waterFoamColor: '#000000',
     waterFoamWidth: 0.19,        // foam reach from the shore, in shore-field units
     waterFoamNoiseFrequency: 0.6,// foam edge noise scale (world XZ multiplier)
+    // Retreat both mask terms from the waterline over this many shore-field
+    // units. Nothing draws along the mesh∩plane intersection itself, hiding
+    // the low-poly faceting of that line behind the smooth field-following
+    // foam edge instead.
+    waterShoreFade: 0.05,
     waterFlowSpeed: 0.03,        // localTime advance per second
     waterRipplesRatio: 0.27,     // 0..1 master fade (future weather hook)
     waterSlopeFrequency: 17,     // number of bands across the shore range
@@ -1659,6 +1664,7 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uFoamColor: { value: new THREE.Color(params.waterFoamColor) },
         uFoamWidth: { value: params.waterFoamWidth },
         uFoamNoiseFrequency: { value: params.waterFoamNoiseFrequency },
+        uShoreFade: { value: params.waterShoreFade },
         uRipplesRatio: { value: params.waterRipplesRatio },
         uSlopeFrequency: { value: params.waterSlopeFrequency },
         uNoiseFrequency: { value: params.waterNoiseFrequency },
@@ -1702,6 +1708,7 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uniform vec3 uFoamColor;
         uniform float uFoamWidth;
         uniform float uFoamNoiseFrequency;
+        uniform float uShoreFade;
         uniform float uRipplesRatio;
         uniform float uSlopeFrequency;
         uniform float uNoiseFrequency;
@@ -1752,17 +1759,15 @@ const waterMaterial = new THREE.RawShaderMaterial({
 
             // TSL threshold.step(ripples) == white where ripples <= threshold.
             float threshold = mix(-1.0, -0.4, uRipplesRatio);
-            // Fade out in the last sliver before the shore: where the sampled
-            // field clamps to ~0 the sawtooth degenerates (whole strips flip in
-            // unison with a frozen noise pattern), so ripples — and only
-            // ripples; the foam belongs AT the shore — retreat from it.
-            return step(ripples, threshold) * smoothstep(0.0, 0.03, shore);
+            // Retreat from the waterline (see uShoreFade note in params).
+            return step(ripples, threshold) * smoothstep(0.0, uShoreFade, shore);
         }
 
-        // Shore foam: solid at the waterline, its outer boundary displaced by
-        // noise so the fringe is irregular, and the noise UV drifts with time
-        // so the edge slowly laps against the shore. Unlike the ripples this
-        // draws right down to the waterline, covering the shoreline seam.
+        // Shore foam: a fringe hugging the waterline, its outer boundary
+        // displaced by noise so it's irregular, and the noise UV drifting with
+        // time so the edge slowly laps against the shore. Fades out right at
+        // the waterline (uShoreFade) so it never touches the polygonal
+        // mesh∩plane intersection line, which would trace the terrain facets.
         float foamTerm(float shore) {
             float n = texture(
                 uNoise,
@@ -1770,7 +1775,8 @@ const waterMaterial = new THREE.RawShaderMaterial({
             ).r;
             // Noise scales the reach: even at n=0 a sliver of foam survives so
             // the terrain rim stays lined; at n=1 it pushes out to full width.
-            return step(shore, uFoamWidth * mix(0.25, 1.0, n));
+            return step(shore, uFoamWidth * mix(0.25, 1.0, n))
+                * smoothstep(0.0, uShoreFade, shore);
         }
 
         void main() {
@@ -2230,6 +2236,8 @@ waterFolder.add(params, 'waterFoamWidth', 0, 0.5, 0.005).name('foam width')
     .onChange((v) => { waterMaterial.uniforms.uFoamWidth.value = v; });
 waterFolder.add(params, 'waterFoamNoiseFrequency', 0.05, 4, 0.05).name('foam scale')
     .onChange((v) => { waterMaterial.uniforms.uFoamNoiseFrequency.value = v; });
+waterFolder.add(params, 'waterShoreFade', 0, 0.3, 0.005).name('shore fade')
+    .onChange((v) => { waterMaterial.uniforms.uShoreFade.value = v; });
 
 const terrainFolder = gui.addFolder('Terrain');
 terrainFolder.addColor(params, 'terrainColor').name('color').onChange((v) => {
