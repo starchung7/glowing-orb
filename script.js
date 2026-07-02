@@ -17,9 +17,9 @@ await RAPIER.init();
 // ----------------------------------------------------------------------------
 // Terrain — the rolling ground from terrain.glb. Loaded up-front so the rest of
 // the scene (orb hover, physics, grass, trees) can conform to its surface.
-// A heightmap is baked once by ray-casting straight down over a regular grid,
-// giving a fast topology-agnostic `terrainHeightAt(x, z)` lookup, a float
-// height texture for the grass shader, and a trimesh for the physics collider.
+// A heightmap is baked once by rasterising the terrain triangles onto a regular
+// grid, giving a fast topology-agnostic `terrainHeightAt(x, z)` lookup, a
+// height texture for the grass/water shaders, and a physics trimesh.
 // ----------------------------------------------------------------------------
 const _terrainGltf = await new GLTFLoader().loadAsync(terrainUrl);
 _terrainGltf.scene.updateMatrixWorld(true);
@@ -54,24 +54,60 @@ const TERRAIN_MIN_X = _terrainBox.min.x;
 const TERRAIN_MIN_Z = _terrainBox.min.z;
 const TERRAIN_SIZE_X = Math.max(1e-4, _terrainBox.max.x - _terrainBox.min.x);
 const TERRAIN_SIZE_Z = Math.max(1e-4, _terrainBox.max.z - _terrainBox.min.z);
-const TERRAIN_TOP = _terrainBox.max.y;
-
-// Bake the heightmap by ray-casting down onto the terrain over a regular grid.
-const HMAP_RES = 96;                 // samples per axis (one-time bake cost)
+// Bake the heightmap by rasterising the terrain triangles onto a regular grid:
+// each triangle is projected to XZ and every grid cell it covers gets its
+// barycentrically-interpolated height (max-combined, i.e. the topmost surface —
+// identical to a downward raycast but orders of magnitude faster, which is what
+// lets the grid be this dense without hurting startup).
+const HMAP_RES = 256;                // samples per axis
 const _heights = new Float32Array(HMAP_RES * HMAP_RES);
 {
-    const ray = new THREE.Raycaster();
-    const down = new THREE.Vector3(0, -1, 0);
-    const origin = new THREE.Vector3();
-    const rayTop = TERRAIN_TOP + 10;
-    for (let iz = 0; iz < HMAP_RES; iz++) {
-        const z = TERRAIN_MIN_Z + (iz / (HMAP_RES - 1)) * TERRAIN_SIZE_Z;
-        for (let ix = 0; ix < HMAP_RES; ix++) {
-            const x = TERRAIN_MIN_X + (ix / (HMAP_RES - 1)) * TERRAIN_SIZE_X;
-            origin.set(x, rayTop, z);
-            ray.set(origin, down);
-            const hit = ray.intersectObject(terrainMesh, false);
-            _heights[iz * HMAP_RES + ix] = hit.length ? hit[0].point.y : _terrainBox.min.y;
+    // Cells no triangle covers (outside the mesh footprint) read as the
+    // terrain's lowest point, same as a missed raycast did before.
+    _heights.fill(_terrainBox.min.y);
+
+    const geo = terrainMesh.geometry;
+    const posAttr = geo.attributes.position;
+    const idxAttr = geo.index;
+    const mw = terrainMesh.matrixWorld;
+    const vA = new THREE.Vector3(), vB = new THREE.Vector3(), vC = new THREE.Vector3();
+    const triCount = (idxAttr ? idxAttr.count : posAttr.count) / 3;
+    // World XZ → continuous grid coordinates (grid points sit at integers).
+    const toGX = (x) => ((x - TERRAIN_MIN_X) / TERRAIN_SIZE_X) * (HMAP_RES - 1);
+    const toGZ = (z) => ((z - TERRAIN_MIN_Z) / TERRAIN_SIZE_Z) * (HMAP_RES - 1);
+
+    for (let t = 0; t < triCount; t++) {
+        const i0 = idxAttr ? idxAttr.getX(t * 3) : t * 3;
+        const i1 = idxAttr ? idxAttr.getX(t * 3 + 1) : t * 3 + 1;
+        const i2 = idxAttr ? idxAttr.getX(t * 3 + 2) : t * 3 + 2;
+        vA.fromBufferAttribute(posAttr, i0).applyMatrix4(mw);
+        vB.fromBufferAttribute(posAttr, i1).applyMatrix4(mw);
+        vC.fromBufferAttribute(posAttr, i2).applyMatrix4(mw);
+
+        const ax = toGX(vA.x), az = toGZ(vA.z);
+        const bx = toGX(vB.x), bz = toGZ(vB.z);
+        const cx = toGX(vC.x), cz = toGZ(vC.z);
+        // Skip triangles that are edge-on in XZ (no downward-facing area).
+        const denom = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz);
+        if (Math.abs(denom) < 1e-10) continue;
+
+        const gx0 = Math.max(0, Math.ceil(Math.min(ax, bx, cx)));
+        const gx1 = Math.min(HMAP_RES - 1, Math.floor(Math.max(ax, bx, cx)));
+        const gz0 = Math.max(0, Math.ceil(Math.min(az, bz, cz)));
+        const gz1 = Math.min(HMAP_RES - 1, Math.floor(Math.max(az, bz, cz)));
+
+        for (let gz = gz0; gz <= gz1; gz++) {
+            for (let gx = gx0; gx <= gx1; gx++) {
+                const w0 = ((bz - cz) * (gx - cx) + (cx - bx) * (gz - cz)) / denom;
+                const w1 = ((cz - az) * (gx - cx) + (ax - cx) * (gz - cz)) / denom;
+                const w2 = 1 - w0 - w1;
+                // Tiny negative tolerance keeps grid points that land exactly
+                // on shared triangle edges from slipping through both tests.
+                if (w0 < -1e-6 || w1 < -1e-6 || w2 < -1e-6) continue;
+                const y = w0 * vA.y + w1 * vB.y + w2 * vC.y;
+                const i = gz * HMAP_RES + gx;
+                if (y > _heights[i]) _heights[i] = y;
+            }
         }
     }
 }
@@ -1630,7 +1666,11 @@ const waterMaterial = new THREE.RawShaderMaterial({
 
             // TSL threshold.step(ripples) == white where ripples <= threshold.
             float threshold = mix(-1.0, -0.4, uRipplesRatio);
-            return step(ripples, threshold);
+            // Fade out in the last sliver before the shore: where the sampled
+            // depth clamps to ~0 the sawtooth degenerates (whole strips flip in
+            // unison with a frozen noise pattern), so ripples — and only
+            // ripples; foam terms belong AT the shore — retreat from it.
+            return step(ripples, threshold) * smoothstep(0.0, 0.03, depth);
         }
 
         void main() {
