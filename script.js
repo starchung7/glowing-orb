@@ -154,6 +154,71 @@ terrainHeightTexture.wrapS = THREE.ClampToEdgeWrapping;
 terrainHeightTexture.wrapT = THREE.ClampToEdgeWrapping;
 terrainHeightTexture.needsUpdate = true;
 
+// Shore-distance field for the water: per cell, the world-space distance to the
+// nearest dry (above-waterline) cell, via a two-pass chamfer distance
+// transform over the baked heights. The water shader draws its foam/ripple
+// pattern in this field instead of raw depth, so every shoreline gets the same
+// world-space fringe width no matter how steeply the terrain drops away
+// underwater (raw depth compresses the pattern to nothing on cliff-like
+// shores, e.g. the terrain mesh's rim). Re-baked when the waterline moves —
+// two O(cells) sweeps, cheap enough to run from the GUI slider.
+const SHORE_DIST_BAKE_RANGE = 0.25 * Math.max(TERRAIN_SIZE_X, TERRAIN_SIZE_Z);
+const _shoreDist = new Float32Array(HMAP_RES * HMAP_RES);
+const _shoreBytes = new Uint8Array(HMAP_RES * HMAP_RES);
+const shoreDistTexture = new THREE.DataTexture(
+    _shoreBytes, HMAP_RES, HMAP_RES, THREE.RedFormat, THREE.UnsignedByteType,
+);
+shoreDistTexture.minFilter = THREE.LinearFilter;
+shoreDistTexture.magFilter = THREE.LinearFilter;
+shoreDistTexture.wrapS = THREE.ClampToEdgeWrapping;
+shoreDistTexture.wrapT = THREE.ClampToEdgeWrapping;
+
+function bakeShoreDistance(surfaceY) {
+    const R = HMAP_RES;
+    const DIAG = Math.SQRT2;
+    // Seed: dry cells are the shore (distance 0), wet cells start at infinity.
+    for (let i = 0; i < _shoreDist.length; i++) {
+        _shoreDist[i] = _heights[i] >= surfaceY ? 0 : Infinity;
+    }
+    // Forward sweep (top-left → bottom-right), then backward: each cell takes
+    // the cheapest path through its already-visited neighbours. Two sweeps
+    // settle the whole grid to within a few % of true Euclidean distance.
+    for (let z = 0; z < R; z++) {
+        for (let x = 0; x < R; x++) {
+            const i = z * R + x;
+            let d = _shoreDist[i];
+            if (x > 0) d = Math.min(d, _shoreDist[i - 1] + 1);
+            if (z > 0) {
+                d = Math.min(d, _shoreDist[i - R] + 1);
+                if (x > 0) d = Math.min(d, _shoreDist[i - R - 1] + DIAG);
+                if (x < R - 1) d = Math.min(d, _shoreDist[i - R + 1] + DIAG);
+            }
+            _shoreDist[i] = d;
+        }
+    }
+    for (let z = R - 1; z >= 0; z--) {
+        for (let x = R - 1; x >= 0; x--) {
+            const i = z * R + x;
+            let d = _shoreDist[i];
+            if (x < R - 1) d = Math.min(d, _shoreDist[i + 1] + 1);
+            if (z < R - 1) {
+                d = Math.min(d, _shoreDist[i + R] + 1);
+                if (x < R - 1) d = Math.min(d, _shoreDist[i + R + 1] + DIAG);
+                if (x > 0) d = Math.min(d, _shoreDist[i + R - 1] + DIAG);
+            }
+            _shoreDist[i] = d;
+        }
+    }
+    // Cell steps → world units, normalised into the bake range for 8-bit
+    // storage (the shader rescales by uShoreRange).
+    const cell = 0.5 * (TERRAIN_SIZE_X + TERRAIN_SIZE_Z) / (R - 1);
+    for (let i = 0; i < _shoreBytes.length; i++) {
+        const d = (_shoreDist[i] * cell) / SHORE_DIST_BAKE_RANGE;
+        _shoreBytes[i] = Math.round(Math.min(1, d) * 255);
+    }
+    shoreDistTexture.needsUpdate = true;
+}
+
 // Trimesh data for the physics ground collider (exact match to the visuals).
 function buildTerrainTrimesh(mesh) {
     const geo = mesh.geometry;
@@ -267,7 +332,10 @@ const params = {
     // maps to "deepest" (fixed, so band density stays put when the elevation
     // slider moves).
     waterElevation: -0.17,
-    waterDepthScale: 0.75,
+    // World-unit distance from shore over which the foam/ripple pattern plays
+    // out (the shore-distance field saturates past it, keeping the middle
+    // clear). Fixed in world units so band spacing is even along every shore.
+    waterShoreRange: 3.0,
     waterColor: '#000000',       // ripple band colour
     // Shore foam (layer 2): an irregular fringe hugging the waterline, its
     // outer edge displaced by drifting noise so it reads as lapping foam.
@@ -1568,15 +1636,17 @@ grass.customDistanceMaterial = grassDistanceMaterial;
 scene.add(grass);
 
 // ----------------------------------------------------------------------------
-// Water, layer 1: animated surface ripples. A flat, static plane at the water
-// surface whose fragment shader draws white contour bands of the water DEPTH
-// (sampled from the baked terrain heightmap), so the bands hug the shoreline
-// for free. Not moving geometry — purely an alpha mask: a sawtooth over depth
-// scrolled by time, wobbled per-band by tiling noise, and biased by depth so
-// bands crowd the shallows and can never appear over deep water.
+// Water: animated surface ripples + shore foam. A flat, static plane at the
+// water surface whose fragment shader draws contour bands of the SHORE
+// DISTANCE field (baked above), so the bands hug every shoreline with even
+// world-space spacing regardless of the terrain's underwater slope. Not moving
+// geometry — purely an alpha mask: a sawtooth over shore distance scrolled by
+// time, wobbled per-band by tiling noise, and biased so bands crowd the
+// waterline and can never appear far from shore (the middle stays clear).
 // Ported from a WebGPU/TSL original to GLSL3, like the grass. The mask is a
-// max() of terms so later layers (shore foam, splashes, ...) can join it.
+// max() of terms so later layers (splashes, ice, ...) can join it.
 // ----------------------------------------------------------------------------
+bakeShoreDistance(params.waterElevation);
 const waterMaterial = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
     transparent: true,
@@ -1589,17 +1659,15 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uFoamColor: { value: new THREE.Color(params.waterFoamColor) },
         uFoamWidth: { value: params.waterFoamWidth },
         uFoamNoiseFrequency: { value: params.waterFoamNoiseFrequency },
-        uSurfaceY: { value: params.waterElevation },
-        uDepthScale: { value: params.waterDepthScale },
         uRipplesRatio: { value: params.waterRipplesRatio },
         uSlopeFrequency: { value: params.waterSlopeFrequency },
         uNoiseFrequency: { value: params.waterNoiseFrequency },
         uNoiseOffset: { value: params.waterNoiseOffset },
-        uHeightMap: { value: terrainHeightTexture },
+        uShoreDist: { value: shoreDistTexture },
+        uShoreBakeRange: { value: SHORE_DIST_BAKE_RANGE },
+        uShoreRange: { value: params.waterShoreRange },
         uTerrainMin: { value: new THREE.Vector2(TERRAIN_MIN_X, TERRAIN_MIN_Z) },
         uTerrainSize: { value: new THREE.Vector2(TERRAIN_SIZE_X, TERRAIN_SIZE_Z) },
-        uHeightMin: { value: TERRAIN_HEIGHT_MIN },
-        uHeightRange: { value: TERRAIN_HEIGHT_RANGE },
         uFogColor: { value: new THREE.Color(params.fogColor) },
         uFogDensity: { value: params.fogDensity },
     },
@@ -1634,36 +1702,43 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uniform vec3 uFoamColor;
         uniform float uFoamWidth;
         uniform float uFoamNoiseFrequency;
-        uniform float uSurfaceY;
-        uniform float uDepthScale;
         uniform float uRipplesRatio;
         uniform float uSlopeFrequency;
         uniform float uNoiseFrequency;
         uniform float uNoiseOffset;
-        uniform sampler2D uHeightMap;
+        uniform sampler2D uShoreDist;
+        uniform float uShoreBakeRange;
+        uniform float uShoreRange;
         uniform vec2 uTerrainMin;
         uniform vec2 uTerrainSize;
-        uniform float uHeightMin;
-        uniform float uHeightRange;
         uniform vec3 uFogColor;
         uniform float uFogDensity;
 
-        // Water depth at a world XZ, 0 = at/above the waterline, 1 = uDepthScale
-        // (or more) below it. The single depth source for every mask term —
-        // later layers (foam, colouring) should call this too.
-        float depthAt(vec2 worldXZ) {
-            vec2 hUV = (worldXZ - uTerrainMin) / uTerrainSize;
-            float terrainY = uHeightMin + texture(uHeightMap, hUV).r * uHeightRange;
-            return clamp((uSurfaceY - terrainY) / uDepthScale, 0.0, 1.0);
+        // Normalised shore distance at a world XZ: 0 at the waterline, 1 at
+        // uShoreRange (or more) world units from the nearest shore. The single
+        // spatial field for every mask term — later layers should call this
+        // too. Being an actual distance (not raw depth), the pattern keeps an
+        // even world-space width along cliff-like and gentle shores alike.
+        float shoreAt(vec2 worldXZ) {
+            vec2 uv = clamp((worldXZ - uTerrainMin) / uTerrainSize, 0.0, 1.0);
+            float d = texture(uShoreDist, uv).r * uShoreBakeRange;
+            // Beyond the baked footprint the texture clamps to its edge texel,
+            // which would freeze the field (degenerate flickering strips out
+            // there). Keep the distance growing instead: add how far the query
+            // point sits outside the footprint, so the pattern continues
+            // smoothly across the terrain boundary and fades out naturally.
+            vec2 clampedWorld = uTerrainMin + uv * uTerrainSize;
+            d += distance(worldXZ, clampedWorld);
+            return clamp(d / uShoreRange, 0.0, 1.0);
         }
 
-        // Contour-band ripples. The sawtooth slices the depth field into bands;
+        // Contour-band ripples. The sawtooth slices the shore field into bands;
         // per-band noise (offset by the band's integer id) wobbles each ring
-        // independently; the depth-bias subtraction (~1.3 in the shallows, ~0 at
-        // full depth) against the -0.4 threshold makes bands dense near shore
-        // and IMPOSSIBLE over deep water — intended look, do not "fix".
-        float ripplesTerm(float depth) {
-            float baseRipple = (depth + uTime * 0.5) * uSlopeFrequency;
+        // independently; the bias subtraction (~1.3 at the waterline, ~0 at
+        // full range) against the -0.4 threshold makes bands crowd the shore
+        // and stay IMPOSSIBLE far from it — intended look, do not "fix".
+        float ripplesTerm(float shore) {
+            float baseRipple = (shore + uTime * 0.5) * uSlopeFrequency;
             float rippleIndex = floor(baseRipple);
 
             float ripplesNoise = texture(
@@ -1672,37 +1747,37 @@ const waterMaterial = new THREE.RawShaderMaterial({
             ).r;
 
             float ripples = fract(baseRipple)
-                - (1.0 - (mix(-0.3, 1.0, depth)))   // depth bias
+                - (1.0 - (mix(-0.3, 1.0, shore)))   // near-shore bias
                 + ripplesNoise;
 
             // TSL threshold.step(ripples) == white where ripples <= threshold.
             float threshold = mix(-1.0, -0.4, uRipplesRatio);
             // Fade out in the last sliver before the shore: where the sampled
-            // depth clamps to ~0 the sawtooth degenerates (whole strips flip in
+            // field clamps to ~0 the sawtooth degenerates (whole strips flip in
             // unison with a frozen noise pattern), so ripples — and only
-            // ripples; foam terms belong AT the shore — retreat from it.
-            return step(ripples, threshold) * smoothstep(0.0, 0.03, depth);
+            // ripples; the foam belongs AT the shore — retreat from it.
+            return step(ripples, threshold) * smoothstep(0.0, 0.03, shore);
         }
 
         // Shore foam: solid at the waterline, its outer boundary displaced by
         // noise so the fringe is irregular, and the noise UV drifts with time
         // so the edge slowly laps against the shore. Unlike the ripples this
-        // draws right down to depth 0, covering the shoreline seam.
-        float foamTerm(float depth) {
+        // draws right down to the waterline, covering the shoreline seam.
+        float foamTerm(float shore) {
             float n = texture(
                 uNoise,
                 vWorldPos.xz * uFoamNoiseFrequency + vec2(uTime * 0.35, uTime * -0.2)
             ).r;
             // Noise scales the reach: even at n=0 a sliver of foam survives so
             // the terrain rim stays lined; at n=1 it pushes out to full width.
-            return step(depth, uFoamWidth * mix(0.25, 1.0, n));
+            return step(shore, uFoamWidth * mix(0.25, 1.0, n));
         }
 
         void main() {
-            float depth = depthAt(vWorldPos.xz);
+            float shore = shoreAt(vWorldPos.xz);
             // max() of mask terms — splash/ice terms join in later layers.
-            float ripples = ripplesTerm(depth);
-            float foam = foamTerm(depth);
+            float ripples = ripplesTerm(shore);
+            float foam = foamTerm(shore);
             float mask = max(ripples, foam);
 
             // Foam wins the colour where present; both dissolve into the fog.
@@ -1714,10 +1789,15 @@ const waterMaterial = new THREE.RawShaderMaterial({
     `,
 });
 
-// Static plane spanning exactly the terrain bounds — beyond them the heightmap
-// clamps to edge values, so there's nothing meaningful to draw anyway and the
-// fog + world boundary hide the rim long before it's reachable.
-const waterGeometry = new THREE.PlaneGeometry(TERRAIN_SIZE_X, TERRAIN_SIZE_Z);
+// Static plane overhanging the terrain bounds so the shoreline pattern isn't
+// clipped where shores run close to the mesh edge. The margin comfortably
+// exceeds the largest GUI shore range; past it the mask is always fully
+// transparent (far from any shore), so the extra area draws nothing.
+const WATER_MARGIN = 20;
+const waterGeometry = new THREE.PlaneGeometry(
+    TERRAIN_SIZE_X + WATER_MARGIN * 2,
+    TERRAIN_SIZE_Z + WATER_MARGIN * 2,
+);
 waterGeometry.rotateX(-Math.PI / 2);
 const water = new THREE.Mesh(waterGeometry, waterMaterial);
 water.position.set(
@@ -2131,7 +2211,7 @@ waterFolder.add(
     TERRAIN_HEIGHT_MIN - 0.5, TERRAIN_HEIGHT_MAX + 0.5, 0.01,
 ).name('elevation').onChange((v) => {
     water.position.y = v;
-    waterMaterial.uniforms.uSurfaceY.value = v;
+    bakeShoreDistance(v); // the shoreline moved — recompute the distance field
 });
 waterFolder.addColor(params, 'waterColor').name('color')
     .onChange((v) => { waterMaterial.uniforms.uColor.value.set(v); });
@@ -2140,10 +2220,8 @@ waterFolder.add(params, 'waterRipplesRatio', 0, 1, 0.01).name('ripples ratio')
 waterFolder.add(params, 'waterSlopeFrequency', 1, 40, 1).name('slope frequency')
     .onChange((v) => { waterMaterial.uniforms.uSlopeFrequency.value = v; });
 waterFolder.add(params, 'waterFlowSpeed', 0, 0.3, 0.005).name('flow speed');
-waterFolder.add(
-    params, 'waterDepthScale', 0.01, Math.max(0.02, TERRAIN_HEIGHT_RANGE), 0.01,
-).name('depth scale')
-    .onChange((v) => { waterMaterial.uniforms.uDepthScale.value = v; });
+waterFolder.add(params, 'waterShoreRange', 0.5, 12, 0.1).name('shore range')
+    .onChange((v) => { waterMaterial.uniforms.uShoreRange.value = v; });
 waterFolder.add(params, 'waterNoiseFrequency', 0.01, 1, 0.005).name('wobble scale')
     .onChange((v) => { waterMaterial.uniforms.uNoiseFrequency.value = v; });
 waterFolder.addColor(params, 'waterFoamColor').name('foam color')
