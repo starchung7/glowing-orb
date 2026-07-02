@@ -227,11 +227,11 @@ const params = {
     respawnFadeIn: 1.2,        // seconds to fade back in after respawning
     // Water (layer 1: ripples) — white depth-contour bands drifting across a
     // transparent plane. Shore foam / colouring / refraction come in later
-    // layers. Elevation defaults into the valleys; depth scale is the world-unit
-    // distance below the surface that maps to "deepest" (fixed, so band density
-    // stays put when the elevation slider moves).
-    waterElevation: TERRAIN_HEIGHT_MIN + TERRAIN_HEIGHT_RANGE * 0.25,
-    waterDepthScale: TERRAIN_HEIGHT_RANGE * 0.25,
+    // layers. Depth scale is the world-unit distance below the surface that
+    // maps to "deepest" (fixed, so band density stays put when the elevation
+    // slider moves).
+    waterElevation: -0.17,
+    waterDepthScale: 0.75,
     waterFlowSpeed: 0.085,       // localTime advance per second
     waterRipplesRatio: 0.41,     // 0..1 master fade (future weather hook)
     waterSlopeFrequency: 10,     // number of bands across the depth range
