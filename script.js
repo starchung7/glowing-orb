@@ -232,6 +232,7 @@ const params = {
     // slider moves).
     waterElevation: -0.17,
     waterDepthScale: 0.75,
+    waterColor: '#000000',       // ripple band colour
     waterFlowSpeed: 0.085,       // localTime advance per second
     waterRipplesRatio: 0.41,     // 0..1 master fade (future weather hook)
     waterSlopeFrequency: 10,     // number of bands across the depth range
@@ -1543,6 +1544,7 @@ const waterMaterial = new THREE.RawShaderMaterial({
     uniforms: {
         uTime: { value: 0 }, // localTime, advanced by dt * waterFlowSpeed
         uNoise: { value: grassNoise },
+        uColor: { value: new THREE.Color(params.waterColor) },
         uSurfaceY: { value: params.waterElevation },
         uDepthScale: { value: params.waterDepthScale },
         uRipplesRatio: { value: params.waterRipplesRatio },
@@ -1584,6 +1586,7 @@ const waterMaterial = new THREE.RawShaderMaterial({
 
         uniform float uTime;
         uniform sampler2D uNoise;
+        uniform vec3 uColor;
         uniform float uSurfaceY;
         uniform float uDepthScale;
         uniform float uRipplesRatio;
@@ -1635,9 +1638,9 @@ const waterMaterial = new THREE.RawShaderMaterial({
             // max() of mask terms — shore/splash/ice terms join in later layers.
             float mask = max(0.0, ripplesTerm(depth));
 
-            // Plain white bands, dissolved into the scene's FogExp2 haze.
+            // Tinted bands, dissolved into the scene's FogExp2 haze.
             float f = 1.0 - exp(-pow(uFogDensity * vFogDist, 2.0));
-            vec3 col = mix(vec3(1.0), uFogColor, clamp(f, 0.0, 1.0));
+            vec3 col = mix(uColor, uFogColor, clamp(f, 0.0, 1.0));
             fragColor = vec4(col, mask);
         }
     `,
@@ -2062,6 +2065,8 @@ waterFolder.add(
     water.position.y = v;
     waterMaterial.uniforms.uSurfaceY.value = v;
 });
+waterFolder.addColor(params, 'waterColor').name('color')
+    .onChange((v) => { waterMaterial.uniforms.uColor.value.set(v); });
 waterFolder.add(params, 'waterRipplesRatio', 0, 1, 0.01).name('ripples ratio')
     .onChange((v) => { waterMaterial.uniforms.uRipplesRatio.value = v; });
 waterFolder.add(params, 'waterSlopeFrequency', 1, 40, 1).name('slope frequency')
