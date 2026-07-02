@@ -269,6 +269,11 @@ const params = {
     waterElevation: -0.17,
     waterDepthScale: 0.75,
     waterColor: '#000000',       // ripple band colour
+    // Shore foam (layer 2): an irregular fringe hugging the waterline, its
+    // outer edge displaced by drifting noise so it reads as lapping foam.
+    waterFoamColor: '#ffffff',
+    waterFoamWidth: 0.12,        // foam reach from the shore, in depth units
+    waterFoamNoiseFrequency: 1.5,// foam edge noise scale (world XZ multiplier)
     waterFlowSpeed: 0.085,       // localTime advance per second
     waterRipplesRatio: 0.41,     // 0..1 master fade (future weather hook)
     waterSlopeFrequency: 10,     // number of bands across the depth range
@@ -1581,6 +1586,9 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uTime: { value: 0 }, // localTime, advanced by dt * waterFlowSpeed
         uNoise: { value: grassNoise },
         uColor: { value: new THREE.Color(params.waterColor) },
+        uFoamColor: { value: new THREE.Color(params.waterFoamColor) },
+        uFoamWidth: { value: params.waterFoamWidth },
+        uFoamNoiseFrequency: { value: params.waterFoamNoiseFrequency },
         uSurfaceY: { value: params.waterElevation },
         uDepthScale: { value: params.waterDepthScale },
         uRipplesRatio: { value: params.waterRipplesRatio },
@@ -1623,6 +1631,9 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uniform float uTime;
         uniform sampler2D uNoise;
         uniform vec3 uColor;
+        uniform vec3 uFoamColor;
+        uniform float uFoamWidth;
+        uniform float uFoamNoiseFrequency;
         uniform float uSurfaceY;
         uniform float uDepthScale;
         uniform float uRipplesRatio;
@@ -1673,14 +1684,31 @@ const waterMaterial = new THREE.RawShaderMaterial({
             return step(ripples, threshold) * smoothstep(0.0, 0.03, depth);
         }
 
+        // Shore foam: solid at the waterline, its outer boundary displaced by
+        // noise so the fringe is irregular, and the noise UV drifts with time
+        // so the edge slowly laps against the shore. Unlike the ripples this
+        // draws right down to depth 0, covering the shoreline seam.
+        float foamTerm(float depth) {
+            float n = texture(
+                uNoise,
+                vWorldPos.xz * uFoamNoiseFrequency + vec2(uTime * 0.35, uTime * -0.2)
+            ).r;
+            // Noise scales the reach: even at n=0 a sliver of foam survives so
+            // the terrain rim stays lined; at n=1 it pushes out to full width.
+            return step(depth, uFoamWidth * mix(0.25, 1.0, n));
+        }
+
         void main() {
             float depth = depthAt(vWorldPos.xz);
-            // max() of mask terms — shore/splash/ice terms join in later layers.
-            float mask = max(0.0, ripplesTerm(depth));
+            // max() of mask terms — splash/ice terms join in later layers.
+            float ripples = ripplesTerm(depth);
+            float foam = foamTerm(depth);
+            float mask = max(ripples, foam);
 
-            // Tinted bands, dissolved into the scene's FogExp2 haze.
+            // Foam wins the colour where present; both dissolve into the fog.
+            vec3 baseCol = mix(uColor, uFoamColor, foam);
             float f = 1.0 - exp(-pow(uFogDensity * vFogDist, 2.0));
-            vec3 col = mix(uColor, uFogColor, clamp(f, 0.0, 1.0));
+            vec3 col = mix(baseCol, uFogColor, clamp(f, 0.0, 1.0));
             fragColor = vec4(col, mask);
         }
     `,
@@ -2118,6 +2146,12 @@ waterFolder.add(
     .onChange((v) => { waterMaterial.uniforms.uDepthScale.value = v; });
 waterFolder.add(params, 'waterNoiseFrequency', 0.01, 1, 0.005).name('wobble scale')
     .onChange((v) => { waterMaterial.uniforms.uNoiseFrequency.value = v; });
+waterFolder.addColor(params, 'waterFoamColor').name('foam color')
+    .onChange((v) => { waterMaterial.uniforms.uFoamColor.value.set(v); });
+waterFolder.add(params, 'waterFoamWidth', 0, 0.5, 0.005).name('foam width')
+    .onChange((v) => { waterMaterial.uniforms.uFoamWidth.value = v; });
+waterFolder.add(params, 'waterFoamNoiseFrequency', 0.05, 4, 0.05).name('foam scale')
+    .onChange((v) => { waterMaterial.uniforms.uFoamNoiseFrequency.value = v; });
 
 const terrainFolder = gui.addFolder('Terrain');
 terrainFolder.addColor(params, 'terrainColor').name('color').onChange((v) => {
