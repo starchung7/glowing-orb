@@ -225,6 +225,18 @@ const params = {
     boundaryWarnOpacity: 0.35, // peak haze opacity in the warning zone
     respawnFadeOut: 0.8,       // seconds to fade to a full white-out
     respawnFadeIn: 1.2,        // seconds to fade back in after respawning
+    // Water (layer 1: ripples) — white depth-contour bands drifting across a
+    // transparent plane. Shore foam / colouring / refraction come in later
+    // layers. Elevation defaults into the valleys; depth scale is the world-unit
+    // distance below the surface that maps to "deepest" (fixed, so band density
+    // stays put when the elevation slider moves).
+    waterElevation: TERRAIN_HEIGHT_MIN + TERRAIN_HEIGHT_RANGE * 0.25,
+    waterDepthScale: TERRAIN_HEIGHT_RANGE * 0.25,
+    waterFlowSpeed: 0.085,       // localTime advance per second
+    waterRipplesRatio: 0.41,     // 0..1 master fade (future weather hook)
+    waterSlopeFrequency: 10,     // number of bands across the depth range
+    waterNoiseFrequency: 0.785,  // wobble texture scale (world XZ multiplier)
+    waterNoiseOffset: 0.345,     // per-band noise offset divisor
 };
 
 const scene = new THREE.Scene();
@@ -1514,6 +1526,137 @@ grass.customDistanceMaterial = grassDistanceMaterial;
 scene.add(grass);
 
 // ----------------------------------------------------------------------------
+// Water, layer 1: animated surface ripples. A flat, static plane at the water
+// surface whose fragment shader draws white contour bands of the water DEPTH
+// (sampled from the baked terrain heightmap), so the bands hug the shoreline
+// for free. Not moving geometry — purely an alpha mask: a sawtooth over depth
+// scrolled by time, wobbled per-band by tiling noise, and biased by depth so
+// bands crowd the shallows and can never appear over deep water.
+// Ported from a WebGPU/TSL original to GLSL3, like the grass. The mask is a
+// max() of terms so later layers (shore foam, splashes, ...) can join it.
+// ----------------------------------------------------------------------------
+const waterMaterial = new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    transparent: true,
+    depthWrite: false, // don't occlude, but still depth-test against terrain
+    side: THREE.DoubleSide,
+    uniforms: {
+        uTime: { value: 0 }, // localTime, advanced by dt * waterFlowSpeed
+        uNoise: { value: grassNoise },
+        uSurfaceY: { value: params.waterElevation },
+        uDepthScale: { value: params.waterDepthScale },
+        uRipplesRatio: { value: params.waterRipplesRatio },
+        uSlopeFrequency: { value: params.waterSlopeFrequency },
+        uNoiseFrequency: { value: params.waterNoiseFrequency },
+        uNoiseOffset: { value: params.waterNoiseOffset },
+        uHeightMap: { value: terrainHeightTexture },
+        uTerrainMin: { value: new THREE.Vector2(TERRAIN_MIN_X, TERRAIN_MIN_Z) },
+        uTerrainSize: { value: new THREE.Vector2(TERRAIN_SIZE_X, TERRAIN_SIZE_Z) },
+        uHeightMin: { value: TERRAIN_HEIGHT_MIN },
+        uHeightRange: { value: TERRAIN_HEIGHT_RANGE },
+        uFogColor: { value: new THREE.Color(params.fogColor) },
+        uFogDensity: { value: params.fogDensity },
+    },
+    vertexShader: /* glsl */ `
+        uniform mat4 modelMatrix;
+        uniform mat4 modelViewMatrix;
+        uniform mat4 projectionMatrix;
+        uniform vec3 cameraPosition;
+
+        in vec3 position;
+
+        out vec3 vWorldPos;
+        out float vFogDist;
+
+        void main() {
+            vec4 wp = modelMatrix * vec4(position, 1.0);
+            vWorldPos = wp.xyz;
+            vFogDist = distance(wp.xyz, cameraPosition);
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+    `,
+    fragmentShader: /* glsl */ `
+        precision highp float;
+
+        in vec3 vWorldPos;
+        in float vFogDist;
+        out vec4 fragColor;
+
+        uniform float uTime;
+        uniform sampler2D uNoise;
+        uniform float uSurfaceY;
+        uniform float uDepthScale;
+        uniform float uRipplesRatio;
+        uniform float uSlopeFrequency;
+        uniform float uNoiseFrequency;
+        uniform float uNoiseOffset;
+        uniform sampler2D uHeightMap;
+        uniform vec2 uTerrainMin;
+        uniform vec2 uTerrainSize;
+        uniform float uHeightMin;
+        uniform float uHeightRange;
+        uniform vec3 uFogColor;
+        uniform float uFogDensity;
+
+        // Water depth at a world XZ, 0 = at/above the waterline, 1 = uDepthScale
+        // (or more) below it. The single depth source for every mask term —
+        // later layers (foam, colouring) should call this too.
+        float depthAt(vec2 worldXZ) {
+            vec2 hUV = (worldXZ - uTerrainMin) / uTerrainSize;
+            float terrainY = uHeightMin + texture(uHeightMap, hUV).r * uHeightRange;
+            return clamp((uSurfaceY - terrainY) / uDepthScale, 0.0, 1.0);
+        }
+
+        // Contour-band ripples. The sawtooth slices the depth field into bands;
+        // per-band noise (offset by the band's integer id) wobbles each ring
+        // independently; the depth-bias subtraction (~1.3 in the shallows, ~0 at
+        // full depth) against the -0.4 threshold makes bands dense near shore
+        // and IMPOSSIBLE over deep water — intended look, do not "fix".
+        float ripplesTerm(float depth) {
+            float baseRipple = (depth + uTime * 0.5) * uSlopeFrequency;
+            float rippleIndex = floor(baseRipple);
+
+            float ripplesNoise = texture(
+                uNoise,
+                (vWorldPos.xz + vec2(rippleIndex / uNoiseOffset)) * uNoiseFrequency
+            ).r;
+
+            float ripples = fract(baseRipple)
+                - (1.0 - (mix(-0.3, 1.0, depth)))   // depth bias
+                + ripplesNoise;
+
+            // TSL threshold.step(ripples) == white where ripples <= threshold.
+            float threshold = mix(-1.0, -0.4, uRipplesRatio);
+            return step(ripples, threshold);
+        }
+
+        void main() {
+            float depth = depthAt(vWorldPos.xz);
+            // max() of mask terms — shore/splash/ice terms join in later layers.
+            float mask = max(0.0, ripplesTerm(depth));
+
+            // Plain white bands, dissolved into the scene's FogExp2 haze.
+            float f = 1.0 - exp(-pow(uFogDensity * vFogDist, 2.0));
+            vec3 col = mix(vec3(1.0), uFogColor, clamp(f, 0.0, 1.0));
+            fragColor = vec4(col, mask);
+        }
+    `,
+});
+
+// Static plane spanning exactly the terrain bounds — beyond them the heightmap
+// clamps to edge values, so there's nothing meaningful to draw anyway and the
+// fog + world boundary hide the rim long before it's reachable.
+const waterGeometry = new THREE.PlaneGeometry(TERRAIN_SIZE_X, TERRAIN_SIZE_Z);
+waterGeometry.rotateX(-Math.PI / 2);
+const water = new THREE.Mesh(waterGeometry, waterMaterial);
+water.position.set(
+    TERRAIN_MIN_X + TERRAIN_SIZE_X * 0.5,
+    params.waterElevation,
+    TERRAIN_MIN_Z + TERRAIN_SIZE_Z * 0.5,
+);
+scene.add(water);
+
+// ----------------------------------------------------------------------------
 // Scattered trees — the tree1.glb model instanced across the explorable area.
 // Drawing N copies of the model as one InstancedMesh per sub-mesh costs only a
 // handful of draw calls regardless of how many trees there are, so it stays
@@ -1750,6 +1893,7 @@ window.addEventListener('resize', () => {
 
 const clock = new THREE.Clock();
 let grassWindTime = 0; // accumulated wind "localTime" (scaled by strength)
+let waterTime = 0;     // water ripple "localTime" (scaled by flow speed)
 const moveDir = new THREE.Vector3();
 const velocity = new THREE.Vector3();
 const targetVelocity = new THREE.Vector3();
@@ -1909,6 +2053,26 @@ grassFolder.addColor(params, 'grassColorBase').name('base color')
     .onChange((v) => grassMaterial.uniforms.uColorBase.value.set(v));
 grassFolder.addColor(params, 'grassColorTip').name('tip color')
     .onChange((v) => grassMaterial.uniforms.uColorTip.value.set(v));
+
+const waterFolder = gui.addFolder('Water');
+waterFolder.add(
+    params, 'waterElevation',
+    TERRAIN_HEIGHT_MIN - 0.5, TERRAIN_HEIGHT_MAX + 0.5, 0.01,
+).name('elevation').onChange((v) => {
+    water.position.y = v;
+    waterMaterial.uniforms.uSurfaceY.value = v;
+});
+waterFolder.add(params, 'waterRipplesRatio', 0, 1, 0.01).name('ripples ratio')
+    .onChange((v) => { waterMaterial.uniforms.uRipplesRatio.value = v; });
+waterFolder.add(params, 'waterSlopeFrequency', 1, 40, 1).name('slope frequency')
+    .onChange((v) => { waterMaterial.uniforms.uSlopeFrequency.value = v; });
+waterFolder.add(params, 'waterFlowSpeed', 0, 0.3, 0.005).name('flow speed');
+waterFolder.add(
+    params, 'waterDepthScale', 0.01, Math.max(0.02, TERRAIN_HEIGHT_RANGE), 0.01,
+).name('depth scale')
+    .onChange((v) => { waterMaterial.uniforms.uDepthScale.value = v; });
+waterFolder.add(params, 'waterNoiseFrequency', 0.01, 1, 0.005).name('wobble scale')
+    .onChange((v) => { waterMaterial.uniforms.uNoiseFrequency.value = v; });
 
 const terrainFolder = gui.addFolder('Terrain');
 terrainFolder.addColor(params, 'terrainColor').name('color').onChange((v) => {
@@ -2155,6 +2319,14 @@ function animate() {
     // Drive the particle field's light reaction from the live orb position.
     particleMaterial.uniforms.uTime.value = clock.elapsedTime;
     particleMaterial.uniforms.uOrbPos.value.copy(orb.position);
+
+    // Water: drift the ripple bands and keep the fog uniforms in step with the
+    // scene fog (which the GUI can retune live).
+    waterTime += dt * params.waterFlowSpeed;
+    const wu = waterMaterial.uniforms;
+    wu.uTime.value = waterTime;
+    wu.uFogColor.value.copy(scene.fog.color);
+    wu.uFogDensity.value = scene.fog.density;
 
     // Grass: re-centre the infinite patch under the orb, advance wind, and sync
     // the orb glow + fog so the field matches the rest of the scene.
