@@ -335,22 +335,26 @@ const params = {
     // World-unit distance from shore over which the foam/ripple pattern plays
     // out (the shore-distance field saturates past it, keeping the middle
     // clear). Fixed in world units so band spacing is even along every shore.
-    waterShoreRange: 1.8,
+    waterShoreRange: 1.6,
+    // Outer reach of the ripples as a fraction of the shore range. Cuts down
+    // WHERE bands appear without rescaling the field they're drawn in, so
+    // band size/spacing stay put (unlike shrinking shore range itself).
+    waterRipplesExtent: 0.32,
     waterColor: '#000000',       // ripple band colour
     // Shore foam (layer 2): an irregular fringe hugging the waterline, its
     // outer edge displaced by drifting noise so it reads as lapping foam.
     waterFoamColor: '#000000',
     waterFoamWidth: 0.19,        // foam reach from the shore, in shore-field units
-    waterFoamNoiseFrequency: 0.6,// foam edge noise scale (world XZ multiplier)
+    waterFoamNoiseFrequency: 0.3,// foam edge noise scale (world XZ multiplier)
     // Retreat both mask terms from the waterline over this many shore-field
     // units. Nothing draws along the mesh∩plane intersection itself, hiding
     // the low-poly faceting of that line behind the smooth field-following
     // foam edge instead.
-    waterShoreFade: 0.05,
+    waterShoreFade: 0.3,
     waterFlowSpeed: 0.03,        // localTime advance per second
-    waterRipplesRatio: 0.27,     // 0..1 master fade (future weather hook)
-    waterSlopeFrequency: 17,     // number of bands across the shore range
-    waterNoiseFrequency: 0.96,   // wobble texture scale (world XZ multiplier)
+    waterRipplesRatio: 0.44,     // 0..1 master fade (future weather hook)
+    waterSlopeFrequency: 11,     // number of bands across the shore range
+    waterNoiseFrequency: 0.385,  // wobble texture scale (world XZ multiplier)
     waterNoiseOffset: 0.345,     // per-band noise offset divisor
 };
 
@@ -1666,6 +1670,7 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uFoamNoiseFrequency: { value: params.waterFoamNoiseFrequency },
         uShoreFade: { value: params.waterShoreFade },
         uRipplesRatio: { value: params.waterRipplesRatio },
+        uRipplesExtent: { value: params.waterRipplesExtent },
         uSlopeFrequency: { value: params.waterSlopeFrequency },
         uNoiseFrequency: { value: params.waterNoiseFrequency },
         uNoiseOffset: { value: params.waterNoiseOffset },
@@ -1710,6 +1715,7 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uniform float uFoamNoiseFrequency;
         uniform float uShoreFade;
         uniform float uRipplesRatio;
+        uniform float uRipplesExtent;
         uniform float uSlopeFrequency;
         uniform float uNoiseFrequency;
         uniform float uNoiseOffset;
@@ -1759,8 +1765,14 @@ const waterMaterial = new THREE.RawShaderMaterial({
 
             // TSL threshold.step(ripples) == white where ripples <= threshold.
             float threshold = mix(-1.0, -0.4, uRipplesRatio);
-            // Retreat from the waterline (see uShoreFade note in params).
-            return step(ripples, threshold) * smoothstep(0.0, uShoreFade, shore);
+            // Retreat from the waterline (see uShoreFade note in params), and
+            // fade out past the extent cutoff — an outer LIMIT on the pattern,
+            // not a rescale of it, so band size/spacing are unaffected. The
+            // fade width (20% of extent) softens the outer boundary so bands
+            // dissolve instead of being sliced off.
+            return step(ripples, threshold)
+                * smoothstep(0.0, uShoreFade, shore)
+                * (1.0 - smoothstep(uRipplesExtent * 0.8, uRipplesExtent, shore));
         }
 
         // Shore foam: a fringe hugging the waterline, its outer boundary
@@ -2223,6 +2235,8 @@ waterFolder.addColor(params, 'waterColor').name('color')
     .onChange((v) => { waterMaterial.uniforms.uColor.value.set(v); });
 waterFolder.add(params, 'waterRipplesRatio', 0, 1, 0.01).name('ripples ratio')
     .onChange((v) => { waterMaterial.uniforms.uRipplesRatio.value = v; });
+waterFolder.add(params, 'waterRipplesExtent', 0.05, 1, 0.01).name('ripples extent')
+    .onChange((v) => { waterMaterial.uniforms.uRipplesExtent.value = v; });
 waterFolder.add(params, 'waterSlopeFrequency', 1, 40, 1).name('slope frequency')
     .onChange((v) => { waterMaterial.uniforms.uSlopeFrequency.value = v; });
 waterFolder.add(params, 'waterFlowSpeed', 0, 0.3, 0.005).name('flow speed');
