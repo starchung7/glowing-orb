@@ -361,6 +361,16 @@ const params = {
     // Wet-shore band on the TERRAIN: smoothly darken the ground below (and a
     // touch above) the waterline. Turns the sharp shading break at the polygon
     // intersection into a soft height gradient, hiding the faceting.
+    // Depth-graded water tint on the TERRAIN itself: where the feature map's
+    // blue channel dominates and the ground sits below the waterline, blend
+    // the terrain colour from a shallow tint at the surface toward a deep
+    // tint as the ground drops. Pure texturing — the "water" is the ground.
+    waterTintEnabled: true,
+    waterTintShallowColor: '#3a4f6e',
+    waterTintDeepColor: '#101b30',
+    waterTintDepthRange: 0.35,  // world units below the tint waterline to reach the deep colour
+    waterTintStrength: 1.0,     // how fully the tint replaces the ground colour
+    waterTintLevel: 0.0,        // tint waterline offset above the actual water elevation
     shoreWetEnabled: true,
     shoreWetColor: '#12101a',
     shoreWetAbove: 0.12,     // world units above the waterline the wetness fades over
@@ -557,6 +567,13 @@ const pathUniforms = {
     // Wet shore band (see params.shoreWet*): shared so the water-elevation
     // slider can move the band on every terrain sub-material at once.
     uWaterLevel: { value: params.waterElevation },
+    // Depth-graded water tint (see params.waterTint*).
+    uWaterTintEnabled: { value: params.waterTintEnabled ? 1 : 0 },
+    uWaterTintShallow: { value: new THREE.Color(params.waterTintShallowColor) },
+    uWaterTintDeep: { value: new THREE.Color(params.waterTintDeepColor) },
+    uWaterTintDepthRange: { value: params.waterTintDepthRange },
+    uWaterTintStrength: { value: params.waterTintStrength },
+    uWaterTintLevel: { value: params.waterTintLevel },
     uShoreWetEnabled: { value: params.shoreWetEnabled ? 1 : 0 },
     uShoreWetColor: { value: new THREE.Color(params.shoreWetColor) },
     uShoreWetAbove: { value: params.shoreWetAbove },
@@ -600,6 +617,12 @@ function applyPathShader(mat) {
                 uniform float uTerrainNoiseContrast;
                 uniform float uTerrainNoiseStrength;
                 uniform float uWaterLevel;
+                uniform float uWaterTintEnabled;
+                uniform vec3 uWaterTintShallow;
+                uniform vec3 uWaterTintDeep;
+                uniform float uWaterTintDepthRange;
+                uniform float uWaterTintStrength;
+                uniform float uWaterTintLevel;
                 uniform float uShoreWetEnabled;
                 uniform vec3 uShoreWetColor;
                 uniform float uShoreWetAbove;
@@ -609,6 +632,12 @@ function applyPathShader(mat) {
                 float pathRed(vec2 uv) {
                     vec3 fc = texture2D(uPathFeatureMap, uv).rgb;
                     return smoothstep(0.02, 0.25, fc.r - max(fc.g, fc.b));
+                }
+
+                // Blue-channel water coverage at a feature-map UV, in [0,1].
+                float waterBlue(vec2 uv) {
+                    vec3 fc = texture2D(uPathFeatureMap, uv).rgb;
+                    return smoothstep(0.02, 0.25, fc.b - max(fc.r, fc.g));
                 }
 
                 float pathHash21(vec2 p) {
@@ -685,6 +714,32 @@ function applyPathShader(mat) {
                     tn = clamp((tn - 0.5) * uTerrainNoiseContrast + 0.5, 0.0, 1.0);
                     float m = 1.0 + (tn - 0.5) * 2.0 * uTerrainNoiseStrength;
                     diffuseColor.rgb *= mix(1.0, m, 1.0 - tileAmount);
+                }
+                // Depth-graded water tint: where the feature map marks water
+                // (blue channel) AND the ground sits below the waterline,
+                // recolour the terrain from a shallow tint at the surface to a
+                // deep tint uWaterTintDepthRange units down. Depth drives the
+                // gradient, so the underwater terrain itself sells the
+                // illusion of water depth — no extra geometry involved.
+                if (uWaterTintEnabled > 0.5) {
+                    vec2 wtUV = (vPathWorld.xz - uPathTerrainMin) / uPathTerrainSize;
+                    float wtInside = step(0.0, wtUV.x) * step(wtUV.x, 1.0) *
+                                     step(0.0, wtUV.y) * step(wtUV.y, 1.0);
+                    float wtMask = waterBlue(wtUV) * wtInside;
+                    // Depth below the tint waterline (the real waterline plus
+                    // the adjustable offset), 0 at the surface. sqrt curve
+                    // front-loads the shallow→deep transition so the deep
+                    // colour shows even in modest basins.
+                    float depth = max((uWaterLevel + uWaterTintLevel) - vPathWorld.y, 0.0);
+                    float depthT = sqrt(clamp(depth / uWaterTintDepthRange, 0.0, 1.0));
+                    vec3 wtCol = mix(uWaterTintShallow, uWaterTintDeep, depthT);
+                    // Only tint underwater ground: fade in just below the
+                    // waterline so the boundary doesn't trace the facets.
+                    float below = smoothstep(0.0, 0.08, depth);
+                    diffuseColor.rgb = mix(
+                        diffuseColor.rgb, wtCol,
+                        wtMask * below * uWaterTintStrength
+                    );
                 }
                 // Wet shore band: darken the ground toward the wet colour as it
                 // dips below the waterline. Being a smooth function of world
@@ -2303,6 +2358,8 @@ waterFolder.add(params, 'waterShoreRange', 0.5, 12, 0.1).name('shore range')
     .onChange((v) => { waterMaterial.uniforms.uShoreRange.value = v; });
 waterFolder.add(params, 'waterNoiseFrequency', 0.01, 1, 0.005).name('wobble scale')
     .onChange((v) => { waterMaterial.uniforms.uNoiseFrequency.value = v; });
+waterFolder.add(params, 'waterNoiseOffset', 0.05, 2, 0.005).name('wobble offset')
+    .onChange((v) => { waterMaterial.uniforms.uNoiseOffset.value = v; });
 waterFolder.addColor(params, 'waterFoamColor').name('foam color')
     .onChange((v) => { waterMaterial.uniforms.uFoamColor.value.set(v); });
 waterFolder.add(params, 'waterFoamWidth', 0, 0.5, 0.005).name('foam width')
@@ -2317,6 +2374,18 @@ waterFolder.add(params, 'waterBodyOpacity', 0, 1, 0.01).name('body opacity')
     .onChange((v) => { waterMaterial.uniforms.uBodyOpacity.value = v; });
 waterFolder.add(params, 'waterBodyRange', 0.01, 1, 0.01).name('body range')
     .onChange((v) => { waterMaterial.uniforms.uBodyRange.value = v; });
+waterFolder.add(params, 'waterTintEnabled').name('depth tint')
+    .onChange((v) => { pathUniforms.uWaterTintEnabled.value = v ? 1 : 0; });
+waterFolder.addColor(params, 'waterTintShallowColor').name('tint shallow')
+    .onChange((v) => { pathUniforms.uWaterTintShallow.value.set(v); });
+waterFolder.addColor(params, 'waterTintDeepColor').name('tint deep')
+    .onChange((v) => { pathUniforms.uWaterTintDeep.value.set(v); });
+waterFolder.add(params, 'waterTintDepthRange', 0.05, 5, 0.05).name('tint depth range')
+    .onChange((v) => { pathUniforms.uWaterTintDepthRange.value = v; });
+waterFolder.add(params, 'waterTintLevel', -2, 10, 0.01).name('tint water level')
+    .onChange((v) => { pathUniforms.uWaterTintLevel.value = v; });
+waterFolder.add(params, 'waterTintStrength', 0, 1, 0.01).name('tint strength')
+    .onChange((v) => { pathUniforms.uWaterTintStrength.value = v; });
 waterFolder.add(params, 'shoreWetEnabled').name('wet shore')
     .onChange((v) => { pathUniforms.uShoreWetEnabled.value = v ? 1 : 0; });
 waterFolder.addColor(params, 'shoreWetColor').name('wet color')
