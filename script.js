@@ -351,6 +351,20 @@ const params = {
     // the low-poly faceting of that line behind the smooth field-following
     // foam edge instead.
     waterShoreFade: 0.3,
+    // Water body (layer 3): a translucent fill over the whole water area whose
+    // edge fades in over the smooth shore-distance FIELD (not the mesh∩plane
+    // line), so the low-poly terrain facets dissolve into the water colour
+    // instead of staying crisply visible right up to the jagged waterline.
+    waterBodyColor: '#0e0d16',
+    waterBodyOpacity: 0.03,  // peak fill opacity, reached uBodyRange from shore
+    waterBodyRange: 0.03,    // shore-field fraction over which the fill fades in
+    // Wet-shore band on the TERRAIN: smoothly darken the ground below (and a
+    // touch above) the waterline. Turns the sharp shading break at the polygon
+    // intersection into a soft height gradient, hiding the faceting.
+    shoreWetEnabled: true,
+    shoreWetColor: '#12101a',
+    shoreWetAbove: 0.12,     // world units above the waterline the wetness fades over
+    shoreWetStrength: 0.85,  // how fully the wet colour replaces the ground tint
     waterFlowSpeed: 0.03,        // localTime advance per second
     waterRipplesRatio: 0.44,     // 0..1 master fade (future weather hook)
     waterSlopeFrequency: 11,     // number of bands across the shore range
@@ -540,6 +554,13 @@ const pathUniforms = {
     uTerrainNoiseScale: { value: params.terrainNoiseScale },
     uTerrainNoiseContrast: { value: params.terrainNoiseContrast },
     uTerrainNoiseStrength: { value: params.terrainNoiseStrength },
+    // Wet shore band (see params.shoreWet*): shared so the water-elevation
+    // slider can move the band on every terrain sub-material at once.
+    uWaterLevel: { value: params.waterElevation },
+    uShoreWetEnabled: { value: params.shoreWetEnabled ? 1 : 0 },
+    uShoreWetColor: { value: new THREE.Color(params.shoreWetColor) },
+    uShoreWetAbove: { value: params.shoreWetAbove },
+    uShoreWetStrength: { value: params.shoreWetStrength },
 };
 
 function applyPathShader(mat) {
@@ -578,6 +599,11 @@ function applyPathShader(mat) {
                 uniform float uTerrainNoiseScale;
                 uniform float uTerrainNoiseContrast;
                 uniform float uTerrainNoiseStrength;
+                uniform float uWaterLevel;
+                uniform float uShoreWetEnabled;
+                uniform vec3 uShoreWetColor;
+                uniform float uShoreWetAbove;
+                uniform float uShoreWetStrength;
 
                 // Red-channel path coverage at a feature-map UV, in [0,1].
                 float pathRed(vec2 uv) {
@@ -659,6 +685,21 @@ function applyPathShader(mat) {
                     tn = clamp((tn - 0.5) * uTerrainNoiseContrast + 0.5, 0.0, 1.0);
                     float m = 1.0 + (tn - 0.5) * 2.0 * uTerrainNoiseStrength;
                     diffuseColor.rgb *= mix(1.0, m, 1.0 - tileAmount);
+                }
+                // Wet shore band: darken the ground toward the wet colour as it
+                // dips below the waterline. Being a smooth function of world
+                // HEIGHT (not the mesh∩water intersection), the transition
+                // sweeps gradually across each facet instead of snapping along
+                // the jagged polygon line, hiding the low-poly shoreline.
+                if (uShoreWetEnabled > 0.5) {
+                    float wet = 1.0 - smoothstep(
+                        uWaterLevel,
+                        uWaterLevel + uShoreWetAbove,
+                        vPathWorld.y
+                    );
+                    diffuseColor.rgb = mix(
+                        diffuseColor.rgb, uShoreWetColor, wet * uShoreWetStrength
+                    );
                 }`,
             );
     };
@@ -1669,6 +1710,9 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uFoamWidth: { value: params.waterFoamWidth },
         uFoamNoiseFrequency: { value: params.waterFoamNoiseFrequency },
         uShoreFade: { value: params.waterShoreFade },
+        uBodyColor: { value: new THREE.Color(params.waterBodyColor) },
+        uBodyOpacity: { value: params.waterBodyOpacity },
+        uBodyRange: { value: params.waterBodyRange },
         uRipplesRatio: { value: params.waterRipplesRatio },
         uRipplesExtent: { value: params.waterRipplesExtent },
         uSlopeFrequency: { value: params.waterSlopeFrequency },
@@ -1714,6 +1758,9 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uniform float uFoamWidth;
         uniform float uFoamNoiseFrequency;
         uniform float uShoreFade;
+        uniform vec3 uBodyColor;
+        uniform float uBodyOpacity;
+        uniform float uBodyRange;
         uniform float uRipplesRatio;
         uniform float uRipplesExtent;
         uniform float uSlopeFrequency;
@@ -1791,15 +1838,26 @@ const waterMaterial = new THREE.RawShaderMaterial({
                 * smoothstep(0.0, uShoreFade, shore);
         }
 
+        // Water body: translucent fill fading in from the shoreline over
+        // uBodyRange of the shore field. Because the fade follows the smooth
+        // baked field, the underwater terrain (and its facets) dissolve into
+        // the water colour gradually — the hard mesh∩plane line never shows.
+        float bodyTerm(float shore) {
+            return smoothstep(0.0, uBodyRange, shore) * uBodyOpacity;
+        }
+
         void main() {
             float shore = shoreAt(vWorldPos.xz);
             // max() of mask terms — splash/ice terms join in later layers.
             float ripples = ripplesTerm(shore);
             float foam = foamTerm(shore);
-            float mask = max(ripples, foam);
+            float body = bodyTerm(shore);
+            float mask = max(max(ripples, foam), body);
 
-            // Foam wins the colour where present; both dissolve into the fog.
-            vec3 baseCol = mix(uColor, uFoamColor, foam);
+            // Foam wins the colour where present, then ripples, then the body
+            // fill; everything dissolves into the fog.
+            vec3 baseCol = mix(uBodyColor, uColor, ripples);
+            baseCol = mix(baseCol, uFoamColor, foam);
             float f = 1.0 - exp(-pow(uFogDensity * vFogDist, 2.0));
             vec3 col = mix(baseCol, uFogColor, clamp(f, 0.0, 1.0));
             fragColor = vec4(col, mask);
@@ -2230,6 +2288,7 @@ waterFolder.add(
 ).name('elevation').onChange((v) => {
     water.position.y = v;
     bakeShoreDistance(v); // the shoreline moved — recompute the distance field
+    pathUniforms.uWaterLevel.value = v; // keep the terrain wet band on the line
 });
 waterFolder.addColor(params, 'waterColor').name('color')
     .onChange((v) => { waterMaterial.uniforms.uColor.value.set(v); });
@@ -2252,6 +2311,20 @@ waterFolder.add(params, 'waterFoamNoiseFrequency', 0.05, 4, 0.05).name('foam sca
     .onChange((v) => { waterMaterial.uniforms.uFoamNoiseFrequency.value = v; });
 waterFolder.add(params, 'waterShoreFade', 0, 0.3, 0.005).name('shore fade')
     .onChange((v) => { waterMaterial.uniforms.uShoreFade.value = v; });
+waterFolder.addColor(params, 'waterBodyColor').name('body color')
+    .onChange((v) => { waterMaterial.uniforms.uBodyColor.value.set(v); });
+waterFolder.add(params, 'waterBodyOpacity', 0, 1, 0.01).name('body opacity')
+    .onChange((v) => { waterMaterial.uniforms.uBodyOpacity.value = v; });
+waterFolder.add(params, 'waterBodyRange', 0.01, 1, 0.01).name('body range')
+    .onChange((v) => { waterMaterial.uniforms.uBodyRange.value = v; });
+waterFolder.add(params, 'shoreWetEnabled').name('wet shore')
+    .onChange((v) => { pathUniforms.uShoreWetEnabled.value = v ? 1 : 0; });
+waterFolder.addColor(params, 'shoreWetColor').name('wet color')
+    .onChange((v) => { pathUniforms.uShoreWetColor.value.set(v); });
+waterFolder.add(params, 'shoreWetAbove', 0, 0.5, 0.005).name('wet fade height')
+    .onChange((v) => { pathUniforms.uShoreWetAbove.value = v; });
+waterFolder.add(params, 'shoreWetStrength', 0, 1, 0.01).name('wet strength')
+    .onChange((v) => { pathUniforms.uShoreWetStrength.value = v; });
 
 const terrainFolder = gui.addFolder('Terrain');
 terrainFolder.addColor(params, 'terrainColor').name('color').onChange((v) => {
