@@ -580,7 +580,11 @@ const pathUniforms = {
     uShoreWetStrength: { value: params.shoreWetStrength },
 };
 
-function applyPathShader(mat) {
+// forceWaterMask: the depth tint normally applies only where the feature map's
+// blue channel marks water (and only inside the terrain bounds, since the map
+// doesn't exist beyond them). The infinite ocean plane passes true so the tint
+// covers it everywhere — out there, everything IS water.
+function applyPathShader(mat, forceWaterMask = false) {
     mat.onBeforeCompile = (shader) => {
         Object.assign(shader.uniforms, pathUniforms);
 
@@ -725,7 +729,9 @@ function applyPathShader(mat) {
                     vec2 wtUV = (vPathWorld.xz - uPathTerrainMin) / uPathTerrainSize;
                     float wtInside = step(0.0, wtUV.x) * step(wtUV.x, 1.0) *
                                      step(0.0, wtUV.y) * step(wtUV.y, 1.0);
-                    float wtMask = waterBlue(wtUV) * wtInside;
+                    float wtMask = ${forceWaterMask
+                        ? '1.0'
+                        : 'waterBlue(wtUV) * wtInside'};
                     // Depth below the tint waterline (the real waterline plus
                     // the adjustable offset), 0 at the surface. sqrt curve
                     // front-loads the shallow→deep transition so the deep
@@ -1948,9 +1954,18 @@ scene.add(water);
 // visible. The world-boundary fog keeps the player near spawn, so a static
 // plane this large can never be out-ranged.
 const OCEAN_SIZE = 600; // fog swallows everything past ~30 units at default density
+// The plane runs the exact same material pipeline as the terrain: a Lambert
+// with the terrain base colour and the same injected shader (noise mottling,
+// depth-graded water tint, wet band, fog), so every stage matches the ground
+// it continues. The only difference is forceWaterMask: out here there's no
+// feature map, so the water tint applies unconditionally.
+const oceanMaterial = new THREE.MeshLambertMaterial({ dithering: true });
+oceanMaterial.color.set(params.terrainColor);
+applyPathShader(oceanMaterial, true);
+terrainMaterials.push(oceanMaterial); // GUI terrain-colour picker retints it too
 const ocean = new THREE.Mesh(
     new THREE.PlaneGeometry(OCEAN_SIZE, OCEAN_SIZE).rotateX(-Math.PI / 2),
-    new THREE.MeshBasicMaterial({ color: params.waterBodyColor, fog: true }),
+    oceanMaterial,
 );
 // A hair below the terrain's lowest vertex so it never z-fights the mesh.
 ocean.position.set(
@@ -2391,10 +2406,7 @@ waterFolder.add(params, 'waterFoamNoiseFrequency', 0.05, 4, 0.05).name('foam sca
 waterFolder.add(params, 'waterShoreFade', 0, 0.3, 0.005).name('shore fade')
     .onChange((v) => { waterMaterial.uniforms.uShoreFade.value = v; });
 waterFolder.addColor(params, 'waterBodyColor').name('body color')
-    .onChange((v) => {
-        waterMaterial.uniforms.uBodyColor.value.set(v);
-        ocean.material.color.set(v); // the infinite ocean shares the body tint
-    });
+    .onChange((v) => { waterMaterial.uniforms.uBodyColor.value.set(v); });
 waterFolder.add(params, 'waterBodyOpacity', 0, 1, 0.01).name('body opacity')
     .onChange((v) => { waterMaterial.uniforms.uBodyOpacity.value = v; });
 waterFolder.add(params, 'waterBodyRange', 0.01, 1, 0.01).name('body range')
