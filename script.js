@@ -156,7 +156,7 @@ terrainHeightTexture.needsUpdate = true;
 
 // Shore-distance field for the water: per cell, the world-space distance to the
 // nearest dry (above-waterline) cell, via a two-pass chamfer distance
-// transform over the baked heights. The water shader draws its foam/ripple
+// transform over the baked heights. The water shader draws its foam
 // pattern in this field instead of raw depth, so every shoreline gets the same
 // world-space fringe width no matter how steeply the terrain drops away
 // underwater (raw depth compresses the pattern to nothing on cliff-like
@@ -326,21 +326,14 @@ const params = {
     boundaryWarnOpacity: 0.35, // peak haze opacity in the warning zone
     respawnFadeOut: 0.8,       // seconds to fade to a full white-out
     respawnFadeIn: 1.2,        // seconds to fade back in after respawning
-    // Water (layer 1: ripples) — white depth-contour bands drifting across a
-    // transparent plane. Shore foam / colouring / refraction come in later
-    // layers. Depth scale is the world-unit distance below the surface that
-    // maps to "deepest" (fixed, so band density stays put when the elevation
-    // slider moves).
+    // Water: a transparent plane at the surface drawing shore foam, a
+    // translucent body fill, and a caustic web (layers below).
     waterElevation: -0.17,
-    // World-unit distance from shore over which the foam/ripple pattern plays
-    // out (the shore-distance field saturates past it, keeping the middle
-    // clear). Fixed in world units so band spacing is even along every shore.
+    // World-unit distance from shore over which the foam pattern plays out
+    // (the shore-distance field saturates past it, keeping the middle clear).
+    // Fixed in world units so the fringe width is even along every shore.
     waterShoreRange: 1.6,
-    // Outer reach of the ripples as a fraction of the shore range. Cuts down
-    // WHERE bands appear without rescaling the field they're drawn in, so
-    // band size/spacing stay put (unlike shrinking shore range itself).
-    waterRipplesExtent: 0.32,
-    waterColor: '#000000',       // ripple band colour
+    waterColor: '#000000',       // caustic web colour
     // Shore foam (layer 2): an irregular fringe hugging the waterline, its
     // outer edge displaced by drifting noise so it reads as lapping foam.
     waterFoamColor: '#000000',
@@ -376,10 +369,6 @@ const params = {
     shoreWetAbove: 0.12,     // world units above the waterline the wetness fades over
     shoreWetStrength: 0.85,  // how fully the wet colour replaces the ground tint
     waterFlowSpeed: 0.03,        // localTime advance per second
-    waterRipplesRatio: 0.44,     // dash coverage: how much of each ring survives
-    waterSlopeFrequency: 11,     // number of rings across the shore range
-    waterNoiseFrequency: 0.385,  // dash/wobble texture scale (world XZ multiplier)
-    waterNoiseOffset: 0.345,     // per-ring dash-noise offset divisor
     // Caustic web (layer 4): a Worley-noise cell-border web drifting across
     // the whole water body at low opacity (see causticsTerm in the shader).
     waterCausticsOpacity: 0.03,  // peak strength of the web (kept subtle)
@@ -1749,15 +1738,12 @@ grass.customDistanceMaterial = grassDistanceMaterial;
 scene.add(grass);
 
 // ----------------------------------------------------------------------------
-// Water: animated surface ripples + shore foam. A flat, static plane at the
-// water surface whose fragment shader draws contour bands of the SHORE
-// DISTANCE field (baked above), so the bands hug every shoreline with even
-// world-space spacing regardless of the terrain's underwater slope. Not moving
-// geometry — purely an alpha mask: a sawtooth over shore distance scrolled by
-// time, wobbled per-band by tiling noise, and biased so bands crowd the
-// waterline and can never appear far from shore (the middle stays clear).
-// Ported from a WebGPU/TSL original to GLSL3, like the grass. The mask is a
-// max() of terms so later layers (splashes, ice, ...) can join it.
+// Water: shore foam + translucent body fill + caustic web. A flat, static
+// plane at the water surface whose fragment shader draws its patterns in the
+// SHORE DISTANCE field (baked above), so the foam fringe hugs every shoreline
+// with even world-space width regardless of the terrain's underwater slope.
+// Not moving geometry — purely an alpha mask. The mask is a max() of terms so
+// later layers (splashes, ice, ...) can join it.
 // ----------------------------------------------------------------------------
 bakeShoreDistance(params.waterElevation);
 const waterMaterial = new THREE.RawShaderMaterial({
@@ -1776,11 +1762,6 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uBodyColor: { value: new THREE.Color(params.waterBodyColor) },
         uBodyOpacity: { value: params.waterBodyOpacity },
         uBodyRange: { value: params.waterBodyRange },
-        uRipplesRatio: { value: params.waterRipplesRatio },
-        uRipplesExtent: { value: params.waterRipplesExtent },
-        uSlopeFrequency: { value: params.waterSlopeFrequency },
-        uNoiseFrequency: { value: params.waterNoiseFrequency },
-        uNoiseOffset: { value: params.waterNoiseOffset },
         uCausticsOpacity: { value: params.waterCausticsOpacity },
         uCausticsScale: { value: params.waterCausticsScale },
         uShoreDist: { value: shoreDistTexture },
@@ -1826,11 +1807,6 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uniform vec3 uBodyColor;
         uniform float uBodyOpacity;
         uniform float uBodyRange;
-        uniform float uRipplesRatio;
-        uniform float uRipplesExtent;
-        uniform float uSlopeFrequency;
-        uniform float uNoiseFrequency;
-        uniform float uNoiseOffset;
         uniform float uCausticsOpacity;
         uniform float uCausticsScale;
         uniform sampler2D uShoreDist;
@@ -1857,62 +1833,6 @@ const waterMaterial = new THREE.RawShaderMaterial({
             vec2 clampedWorld = uTerrainMin + uv * uTerrainSize;
             d += distance(worldXZ, clampedWorld);
             return clamp(d / uShoreRange, 0.0, 1.0);
-        }
-
-        // Shoreline ripples: constant-thickness dashed rings drifting toward
-        // the shore. Three ingredients, each with exactly one job:
-        //   1. A sawtooth of shore distance + time slices the water into
-        //      drifting rings; the visible line sits at phase 0.5 so the
-        //      sawtooth seam (where the ring id flips and the gate noise
-        //      changes) never crosses a visible line.
-        //   2. Static noise warps the shore field slightly so the rings are
-        //      wavy instead of clean parallel contours.
-        //   3. A per-ring noise gate switches the line on/off along its
-        //      length, breaking each ring into short dashes with soft ends.
-        // Thickness is a CONSTANT in phase units. Noise only ever decides
-        // WHERE a dash shows, never how thick it is, so the old failure mode
-        // (near-shore bias + low noise inflating a line into a blob of raw
-        // noise texture, worst along the terrain rim) cannot happen here.
-        // The fractal noise texture's values are NOT 0..1: octave averaging
-        // squashes them to ~[0, 0.44] with a median near 0.23 (measured).
-        // Renormalise samples before using them as gates/wobbles here.
-        float rippleNoiseSample(vec2 uv) {
-            return clamp(texture(uNoise, uv).r * 2.2, 0.0, 1.0);
-        }
-
-        float ripplesTerm(float shore) {
-            // (2) wavy warp, capped at ~1/4 of the ring spacing so
-            // neighbouring rings can never touch.
-            float wobble = rippleNoiseSample(vWorldPos.xz * uNoiseFrequency * 1.7) - 0.5;
-            float saw = (shore + wobble * (0.5 / uSlopeFrequency) + uTime * 0.5)
-                * uSlopeFrequency;
-            float ring = floor(saw);
-            float phase = fract(saw);
-
-            // (1) fixed-width line centred at phase 0.5, edges softened by
-            // the pattern's per-pixel footprint. Where rings pack tighter
-            // than a pixel (grazing views, far distance, steep spots in the
-            // shore field) the whole pattern dissolves instead of aliasing.
-            float fw = fwidth(saw) + 0.001;
-            const float HALF_WIDTH = 0.10;
-            float line = smoothstep(0.5 - HALF_WIDTH - fw, 0.5 - HALF_WIDTH, phase)
-                * (1.0 - smoothstep(0.5 + HALF_WIDTH, 0.5 + HALF_WIDTH + fw, phase));
-            line *= 1.0 - smoothstep(0.35, 1.0, fw);
-
-            // (3) dash gate, decorrelated per ring via the id offset. The
-            // ratio param is now literal coverage: how much of each ring
-            // survives the gate (0 = nothing, 1 = unbroken rings).
-            float gate = rippleNoiseSample(
-                (vWorldPos.xz + vec2(ring / uNoiseOffset)) * uNoiseFrequency
-            );
-            float cut = 1.0 - uRipplesRatio;
-            line *= smoothstep(cut, cut + 0.15, gate);
-
-            // Hold off the waterline itself (foam owns that zone), fade out
-            // past the extent cutoff.
-            return line
-                * smoothstep(0.0, uShoreFade, shore)
-                * (1.0 - smoothstep(uRipplesExtent * 0.8, uRipplesExtent, shore));
         }
 
         // Shore foam: a fringe hugging the waterline, its outer boundary
@@ -1968,8 +1888,9 @@ const waterMaterial = new THREE.RawShaderMaterial({
             // biggest step from "diagram" to "water". Warp features are
             // roughly cell-sized so borders bow without shattering, and the
             // two channels drift on different headings so the wobble itself
-            // slowly changes shape. (Noise values centre near 0.23, see
-            // rippleNoiseSample — subtract that, not 0.5.)
+            // slowly changes shape. (The fractal noise texture's values are
+            // squashed to ~[0, 0.44] by octave averaging, centring near 0.23
+            // — subtract that, not 0.5.)
             vec2 warp = vec2(
                 texture(uNoise, p * 0.13 + vec2(uTime * 0.9, uTime * -0.4)).r,
                 texture(uNoise, p * 0.17 + vec2(uTime * -0.6, uTime * 0.8)).r
@@ -2012,7 +1933,6 @@ const waterMaterial = new THREE.RawShaderMaterial({
         void main() {
             float shore = shoreAt(vWorldPos.xz);
             // max() of mask terms — splash/ice terms join in later layers.
-            float ripples = ripplesTerm(shore);
             float foam = foamTerm(shore);
             float body = bodyTerm(shore);
             // Caustics ADD to the coverage instead of max()-ing: the web is a
@@ -2020,11 +1940,11 @@ const waterMaterial = new THREE.RawShaderMaterial({
             // brightening of the water (the plane's colour is fog-lit) rather
             // than a hard second pattern.
             float caustics = causticsTerm(shore) * uCausticsOpacity;
-            float mask = min(max(max(ripples, foam), body) + caustics, 1.0);
+            float mask = min(max(foam, body) + caustics, 1.0);
 
-            // Foam wins the colour where present, then ripples, then the body
-            // fill; everything dissolves into the fog.
-            vec3 baseCol = mix(uBodyColor, uColor, max(ripples, caustics));
+            // Foam wins the colour where present, then caustics, then the
+            // body fill; everything dissolves into the fog.
+            vec3 baseCol = mix(uBodyColor, uColor, caustics);
             baseCol = mix(baseCol, uFoamColor, foam);
             float f = 1.0 - exp(-pow(uFogDensity * vFogDist, 2.0));
             vec3 col = mix(baseCol, uFogColor, clamp(f, 0.0, 1.0));
@@ -2316,7 +2236,7 @@ window.addEventListener('resize', () => {
 
 const clock = new THREE.Clock();
 let grassWindTime = 0; // accumulated wind "localTime" (scaled by strength)
-let waterTime = 0;     // water ripple "localTime" (scaled by flow speed)
+let waterTime = 0;     // water surface "localTime" (scaled by flow speed)
 const moveDir = new THREE.Vector3();
 const velocity = new THREE.Vector3();
 const targetVelocity = new THREE.Vector3();
@@ -2488,19 +2408,9 @@ waterFolder.add(
 });
 waterFolder.addColor(params, 'waterColor').name('color')
     .onChange((v) => { waterMaterial.uniforms.uColor.value.set(v); });
-waterFolder.add(params, 'waterRipplesRatio', 0, 1, 0.01).name('ripples ratio')
-    .onChange((v) => { waterMaterial.uniforms.uRipplesRatio.value = v; });
-waterFolder.add(params, 'waterRipplesExtent', 0.05, 1, 0.01).name('ripples extent')
-    .onChange((v) => { waterMaterial.uniforms.uRipplesExtent.value = v; });
-waterFolder.add(params, 'waterSlopeFrequency', 1, 40, 1).name('slope frequency')
-    .onChange((v) => { waterMaterial.uniforms.uSlopeFrequency.value = v; });
 waterFolder.add(params, 'waterFlowSpeed', 0, 0.3, 0.005).name('flow speed');
 waterFolder.add(params, 'waterShoreRange', 0.5, 12, 0.1).name('shore range')
     .onChange((v) => { waterMaterial.uniforms.uShoreRange.value = v; });
-waterFolder.add(params, 'waterNoiseFrequency', 0.01, 1, 0.005).name('wobble scale')
-    .onChange((v) => { waterMaterial.uniforms.uNoiseFrequency.value = v; });
-waterFolder.add(params, 'waterNoiseOffset', 0.05, 2, 0.005).name('wobble offset')
-    .onChange((v) => { waterMaterial.uniforms.uNoiseOffset.value = v; });
 waterFolder.add(params, 'waterCausticsOpacity', 0, 0.6, 0.01).name('caustics opacity')
     .onChange((v) => { waterMaterial.uniforms.uCausticsOpacity.value = v; });
 waterFolder.add(params, 'waterCausticsScale', 0.01, 0.3, 0.005).name('caustics scale')
@@ -2786,8 +2696,8 @@ function animate() {
     particleMaterial.uniforms.uTime.value = clock.elapsedTime;
     particleMaterial.uniforms.uOrbPos.value.copy(orb.position);
 
-    // Water: drift the ripple bands and keep the fog uniforms in step with the
-    // scene fog (which the GUI can retune live).
+    // Water: advance the surface animation and keep the fog uniforms in step
+    // with the scene fog (which the GUI can retune live).
     waterTime += dt * params.waterFlowSpeed;
     const wu = waterMaterial.uniforms;
     wu.uTime.value = waterTime;
