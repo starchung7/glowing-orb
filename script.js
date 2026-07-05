@@ -356,10 +356,11 @@ const params = {
     // Wet-shore band on the TERRAIN: smoothly darken the ground below (and a
     // touch above) the waterline. Turns the sharp shading break at the polygon
     // intersection into a soft height gradient, hiding the faceting.
-    // Depth-graded water tint on the TERRAIN itself: where the feature map's
-    // blue channel dominates and the ground sits below the waterline, blend
-    // the terrain colour from a shallow tint at the surface toward a deep
-    // tint as the ground drops. Pure texturing — the "water" is the ground.
+    // Depth-graded water tint on the TERRAIN itself: wherever the ground sits
+    // below the waterline, blend the terrain colour from a shallow tint at the
+    // surface toward a deep tint as the ground drops. Driven purely by
+    // elevation so it always lines up with the water plane, shore foam and
+    // caustics. Pure texturing — the "water" is the ground.
     waterTintEnabled: true,
     waterTintShallowColor: '#3a4f6e',
     waterTintDeepColor: '#101b30',
@@ -630,12 +631,6 @@ function applyPathShader(mat) {
                     return smoothstep(0.02, 0.25, fc.r - max(fc.g, fc.b));
                 }
 
-                // Blue-channel water coverage at a feature-map UV, in [0,1].
-                float waterBlue(vec2 uv) {
-                    vec3 fc = texture2D(uPathFeatureMap, uv).rgb;
-                    return smoothstep(0.02, 0.25, fc.b - max(fc.r, fc.g));
-                }
-
                 float pathHash21(vec2 p) {
                     p = fract(p * vec2(123.34, 345.45));
                     p += dot(p, p + 34.345);
@@ -711,21 +706,14 @@ function applyPathShader(mat) {
                     float m = 1.0 + (tn - 0.5) * 2.0 * uTerrainNoiseStrength;
                     diffuseColor.rgb *= mix(1.0, m, 1.0 - tileAmount);
                 }
-                // Depth-graded water tint: where the feature map marks water
-                // (blue channel) AND the ground sits below the waterline,
-                // recolour the terrain from a shallow tint at the surface to a
-                // deep tint uWaterTintDepthRange units down. Depth drives the
-                // gradient, so the underwater terrain itself sells the
-                // illusion of water depth — no extra geometry involved.
+                // Depth-graded water tint: wherever the ground sits below the
+                // waterline, recolour the terrain from a shallow tint at the
+                // surface to a deep tint uWaterTintDepthRange units down.
+                // Purely elevation-driven (NOT the feature map's blue channel),
+                // so the tint always matches the water plane, shoreline foam
+                // and caustics exactly. Depth drives the gradient, so the
+                // underwater terrain itself sells the illusion of water depth.
                 if (uWaterTintEnabled > 0.5) {
-                    vec2 wtUV = (vPathWorld.xz - uPathTerrainMin) / uPathTerrainSize;
-                    float wtInside = step(0.0, wtUV.x) * step(wtUV.x, 1.0) *
-                                     step(0.0, wtUV.y) * step(wtUV.y, 1.0);
-                    // Inside the terrain bounds the feature map's blue channel
-                    // gates the tint; outside them the map doesn't exist and
-                    // the only geometry is the infinite ocean plane, which is
-                    // all water — so the mask is fully on out there.
-                    float wtMask = mix(1.0, waterBlue(wtUV), wtInside);
                     // Depth below the tint waterline (the real waterline plus
                     // the adjustable offset), 0 at the surface. sqrt curve
                     // front-loads the shallow→deep transition so the deep
@@ -738,7 +726,7 @@ function applyPathShader(mat) {
                     float below = smoothstep(0.0, 0.08, depth);
                     diffuseColor.rgb = mix(
                         diffuseColor.rgb, wtCol,
-                        wtMask * below * uWaterTintStrength
+                        below * uWaterTintStrength
                     );
                 }
                 // Wet shore band: darken the ground toward the wet colour as it
