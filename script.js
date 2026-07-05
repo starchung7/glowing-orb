@@ -225,6 +225,28 @@ const params = {
     boundaryWarnOpacity: 0.35, // peak haze opacity in the warning zone
     respawnFadeOut: 0.8,       // seconds to fade to a full white-out
     respawnFadeIn: 1.2,        // seconds to fade back in after respawning
+    // Toon water — a single transparent plane at waterElevation. Coverage comes
+    // from the feature map's blue channel; foam hugs a baked shore-distance
+    // field; ripples/waves are purely animated fragment work (no moving verts).
+    waterElevation: -0.17,
+    waterShallowColor: '#39418c', // body colour right at the shoreline
+    waterDeepColor: '#0f0d26',    // body colour at waterDepthRange below the line
+    waterDepthRange: 0.35,    // world units below the waterline to reach the deep colour
+    waterShallowOpacity: 0.3, // body alpha in the shallows (see-through)
+    waterDeepOpacity: 0.85,   // body alpha at full depth
+    waterFlowSpeed: 1.0,      // master animation-speed multiplier
+    waterFoamColor: '#eceafe',
+    waterFoamOpacity: 0.95,
+    waterFoamWidth: 0.35,     // world-unit reach of the shoreline foam fringe
+    waterFoamNoiseScale: 0.5, // noise frequency shaping the foam's ragged edge
+    waterRippleColor: '#aab4ea',
+    waterRippleScale: 1.3,    // cells per world unit of the Voronoi ripple pattern
+    waterRippleWidth: 0.08,   // cell-border thickness (bigger = fatter lines)
+    waterRippleStrength: 0.45,// ripple line opacity
+    waterWavesEnabled: true,  // periodic crests lapping toward the shore
+    waterWaveLength: 1.1,     // world-unit spacing between crests
+    waterWaveSpeed: 0.25,     // crest travel speed (wavelengths per second)
+    waterWaveExtent: 2.4,     // how far offshore the crests remain visible
 };
 
 const scene = new THREE.Scene();
@@ -1514,6 +1536,334 @@ grass.customDistanceMaterial = grassDistanceMaterial;
 scene.add(grass);
 
 // ----------------------------------------------------------------------------
+// Toon water — a single static, transparent plane at params.waterElevation.
+// Coverage comes from the feature map's blue channel (same XZ→UV mapping as
+// the paths and grass), so water only ever appears where terrain.png paints
+// it. All the styling is fragment-shader work on that one quad:
+//   • a depth-graded translucent body (real terrain depth below the waterline
+//     drives colour + opacity, so submerged features stay visible),
+//   • shoreline foam hugging a baked shore-distance field, with a detached
+//     outline ring and a noise-lapped ragged edge,
+//   • toon "cellular" ripples from two counter-drifting noise fields,
+//   • periodic wave crests marching toward the shore.
+// One draw call, no moving vertices, ~6 texture fetches per fragment.
+// ----------------------------------------------------------------------------
+
+// Read the feature map's pixels once on the CPU so the blue channel can seed
+// the shore-distance bake below (the GPU texture can't be read back cheaply).
+const _featPixels = await new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+        const cv = document.createElement('canvas');
+        cv.width = img.naturalWidth;
+        cv.height = img.naturalHeight;
+        const ctx = cv.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        resolve({
+            data: ctx.getImageData(0, 0, cv.width, cv.height).data,
+            width: cv.width,
+            height: cv.height,
+        });
+    };
+    img.onerror = reject;
+    img.src = featureMapUrl;
+});
+
+const WATER_RES = 320; // bake grid per axis (~0.15 world units per cell)
+const WATER_SHORE_BAKE_RANGE = 8; // world units mapped onto the 8-bit distance
+
+// Static per-cell "the map paints water here" flags (blue channel dominant).
+// Only the height check depends on the elevation slider, so this half of the
+// wet/dry decision never needs recomputing.
+const _waterBlue = new Uint8Array(WATER_RES * WATER_RES);
+{
+    const { data, width, height } = _featPixels;
+    for (let iz = 0; iz < WATER_RES; iz++) {
+        // flipY=false texture ↔ image row order match: v = iz/(R-1) → row v*(H-1).
+        const py = Math.round((iz / (WATER_RES - 1)) * (height - 1));
+        for (let ix = 0; ix < WATER_RES; ix++) {
+            const px = Math.round((ix / (WATER_RES - 1)) * (width - 1));
+            const o = (py * width + px) * 4;
+            const r = data[o], g = data[o + 1], b = data[o + 2];
+            _waterBlue[iz * WATER_RES + ix] = b - Math.max(r, g) > 25 ? 1 : 0;
+        }
+    }
+}
+
+// Shore-distance field: per cell, the world-space distance to the nearest dry
+// cell, via a two-pass chamfer distance transform. Foam/wave patterns are
+// drawn in this field instead of raw depth so every shoreline gets the same
+// world-space fringe width no matter how steeply the ground drops away.
+// R = distance (normalised to the bake range), G = water coverage mask.
+const _waterDist = new Float32Array(WATER_RES * WATER_RES);
+const _waterBytes = new Uint8Array(WATER_RES * WATER_RES * 2);
+const waterShoreTexture = new THREE.DataTexture(
+    _waterBytes, WATER_RES, WATER_RES, THREE.RGFormat, THREE.UnsignedByteType,
+);
+waterShoreTexture.minFilter = THREE.LinearFilter;
+waterShoreTexture.magFilter = THREE.LinearFilter;
+waterShoreTexture.wrapS = THREE.ClampToEdgeWrapping;
+waterShoreTexture.wrapT = THREE.ClampToEdgeWrapping;
+
+function bakeWaterShore(surfaceY) {
+    const R = WATER_RES;
+    const DIAG = Math.SQRT2;
+    // Seed: a cell is water when the map paints it blue AND the ground actually
+    // sits below the waterline; everything else is dry shore (distance 0). The
+    // height check keeps foam hugging terrain that pokes through the surface
+    // even where the blue paint is coarse around it.
+    for (let iz = 0; iz < R; iz++) {
+        const z = TERRAIN_MIN_Z + (iz / (R - 1)) * TERRAIN_SIZE_Z;
+        for (let ix = 0; ix < R; ix++) {
+            const x = TERRAIN_MIN_X + (ix / (R - 1)) * TERRAIN_SIZE_X;
+            const i = iz * R + ix;
+            const wet = _waterBlue[i] === 1 && terrainHeightAt(x, z) < surfaceY;
+            _waterDist[i] = wet ? Infinity : 0;
+            _waterBytes[i * 2 + 1] = wet ? 255 : 0;
+        }
+    }
+    // Forward sweep (top-left → bottom-right), then backward: each cell takes
+    // the cheapest path through its already-visited neighbours. Two sweeps
+    // settle the grid to within a few % of true Euclidean distance.
+    for (let z = 0; z < R; z++) {
+        for (let x = 0; x < R; x++) {
+            const i = z * R + x;
+            let d = _waterDist[i];
+            if (x > 0) d = Math.min(d, _waterDist[i - 1] + 1);
+            if (z > 0) {
+                d = Math.min(d, _waterDist[i - R] + 1);
+                if (x > 0) d = Math.min(d, _waterDist[i - R - 1] + DIAG);
+                if (x < R - 1) d = Math.min(d, _waterDist[i - R + 1] + DIAG);
+            }
+            _waterDist[i] = d;
+        }
+    }
+    for (let z = R - 1; z >= 0; z--) {
+        for (let x = R - 1; x >= 0; x--) {
+            const i = z * R + x;
+            let d = _waterDist[i];
+            if (x < R - 1) d = Math.min(d, _waterDist[i + 1] + 1);
+            if (z < R - 1) {
+                d = Math.min(d, _waterDist[i + R] + 1);
+                if (x < R - 1) d = Math.min(d, _waterDist[i + R + 1] + DIAG);
+                if (x > 0) d = Math.min(d, _waterDist[i + R - 1] + DIAG);
+            }
+            _waterDist[i] = d;
+        }
+    }
+    // Cell steps → world units, normalised into the bake range for 8-bit
+    // storage (the shader rescales by uShoreBakeRange).
+    const cell = 0.5 * (TERRAIN_SIZE_X + TERRAIN_SIZE_Z) / (R - 1);
+    for (let i = 0; i < R * R; i++) {
+        const d = (_waterDist[i] * cell) / WATER_SHORE_BAKE_RANGE;
+        _waterBytes[i * 2] = Math.round(Math.min(1, d) * 255);
+    }
+    waterShoreTexture.needsUpdate = true;
+}
+bakeWaterShore(params.waterElevation);
+
+const waterMaterial = new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    transparent: true,
+    depthWrite: false, // don't occlude, but still depth-test against terrain
+    uniforms: {
+        uTime: { value: 0 }, // localTime, advanced by dt * waterFlowSpeed
+        uNoise: { value: grassNoise },
+        uShoreTex: { value: waterShoreTexture },
+        uShoreBakeRange: { value: WATER_SHORE_BAKE_RANGE },
+        uTerrainMin: { value: new THREE.Vector2(TERRAIN_MIN_X, TERRAIN_MIN_Z) },
+        uTerrainSize: { value: new THREE.Vector2(TERRAIN_SIZE_X, TERRAIN_SIZE_Z) },
+        uHeightMap: { value: terrainHeightTexture },
+        uHeightMin: { value: TERRAIN_HEIGHT_MIN },
+        uHeightRange: { value: TERRAIN_HEIGHT_RANGE },
+        uWaterY: { value: params.waterElevation },
+        uShallowColor: { value: new THREE.Color(params.waterShallowColor) },
+        uDeepColor: { value: new THREE.Color(params.waterDeepColor) },
+        uDepthRange: { value: params.waterDepthRange },
+        uShallowOpacity: { value: params.waterShallowOpacity },
+        uDeepOpacity: { value: params.waterDeepOpacity },
+        uFoamColor: { value: new THREE.Color(params.waterFoamColor) },
+        uFoamOpacity: { value: params.waterFoamOpacity },
+        uFoamWidth: { value: params.waterFoamWidth },
+        uFoamNoiseScale: { value: params.waterFoamNoiseScale },
+        uRippleColor: { value: new THREE.Color(params.waterRippleColor) },
+        uRippleScale: { value: params.waterRippleScale },
+        uRippleWidth: { value: params.waterRippleWidth },
+        uRippleStrength: { value: params.waterRippleStrength },
+        uWavesEnabled: { value: params.waterWavesEnabled ? 1 : 0 },
+        uWaveLength: { value: params.waterWaveLength },
+        uWaveSpeed: { value: params.waterWaveSpeed },
+        uWaveExtent: { value: params.waterWaveExtent },
+        uFogColor: { value: new THREE.Color(params.fogColor) },
+        uFogDensity: { value: params.fogDensity },
+    },
+    vertexShader: /* glsl */ `
+        uniform mat4 modelMatrix;
+        uniform mat4 modelViewMatrix;
+        uniform mat4 projectionMatrix;
+        uniform vec3 cameraPosition;
+
+        in vec3 position;
+
+        out vec3 vWorldPos;
+        out float vFogDist;
+
+        void main() {
+            vec4 wp = modelMatrix * vec4(position, 1.0);
+            vWorldPos = wp.xyz;
+            vFogDist = distance(wp.xyz, cameraPosition);
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+    `,
+    fragmentShader: /* glsl */ `
+        precision highp float;
+
+        in vec3 vWorldPos;
+        in float vFogDist;
+        out vec4 fragColor;
+
+        uniform float uTime;
+        uniform sampler2D uNoise;
+        uniform sampler2D uShoreTex;
+        uniform float uShoreBakeRange;
+        uniform vec2 uTerrainMin;
+        uniform vec2 uTerrainSize;
+        uniform sampler2D uHeightMap;
+        uniform float uHeightMin;
+        uniform float uHeightRange;
+        uniform float uWaterY;
+        uniform vec3 uShallowColor;
+        uniform vec3 uDeepColor;
+        uniform float uDepthRange;
+        uniform float uShallowOpacity;
+        uniform float uDeepOpacity;
+        uniform vec3 uFoamColor;
+        uniform float uFoamOpacity;
+        uniform float uFoamWidth;
+        uniform float uFoamNoiseScale;
+        uniform vec3 uRippleColor;
+        uniform float uRippleScale;
+        uniform float uRippleWidth;
+        uniform float uRippleStrength;
+        uniform float uWavesEnabled;
+        uniform float uWaveLength;
+        uniform float uWaveSpeed;
+        uniform float uWaveExtent;
+        uniform vec3 uFogColor;
+        uniform float uFogDensity;
+
+        vec2 rippleHash22(vec2 p) {
+            vec3 q = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+            q += dot(q, q.yzx + 33.33);
+            return fract((q.xx + q.yz) * q.zy);
+        }
+
+        // Toon "cellular" ripples: animated Voronoi cell borders. Each lattice
+        // cell owns a feature point orbiting on a small circle; where the
+        // nearest two points are equidistant (F2 ≈ F1) a thin bright border
+        // lights up, giving the honeycomb caustic cells that continuously
+        // merge and split. The narrow smoothstep keeps them hard-edged (toon).
+        float ripplesTerm(float shore) {
+            vec2 p = vWorldPos.xz * uRippleScale;
+            vec2 ip = floor(p);
+            vec2 fp = fract(p);
+            float f1 = 8.0, f2 = 8.0;
+            for (int y = -1; y <= 1; y++)
+            for (int x = -1; x <= 1; x++) {
+                vec2 g = vec2(float(x), float(y));
+                vec2 h = rippleHash22(ip + g);
+                vec2 o = 0.5 + 0.35 * sin(uTime * 0.5 + h * 12.566);
+                vec2 d2 = g + o - fp;
+                float d = dot(d2, d2);
+                if (d < f1) { f2 = f1; f1 = d; }
+                else if (d < f2) { f2 = d; }
+            }
+            float border = sqrt(f2) - sqrt(f1); // ~0 along cell boundaries
+            float lines = 1.0 - smoothstep(uRippleWidth * 0.4, uRippleWidth, border);
+            // Foam owns the immediate shoreline; ripples fade in just past it.
+            return lines * smoothstep(0.08, 0.35, shore);
+        }
+
+        // Wave crests: contour lines of the shore field marching toward the
+        // waterline, wobbled by low-frequency noise so they don't trace
+        // perfect offset rings. Confined between the foam fringe and
+        // uWaveExtent so the open water stays calm.
+        float wavesTerm(float shore) {
+            float wob = (texture(uNoise, vWorldPos.xz * 0.13 + vec2(uTime * 0.008)).r - 0.5) * 0.25;
+            float phase = fract(shore / uWaveLength + wob + uTime * uWaveSpeed);
+            float crest = 1.0 - smoothstep(0.03, 0.08, abs(phase - 0.5));
+            // Keep a calm gap between the foam band and the first crest, and
+            // fade the crests out well before open water.
+            crest *= smoothstep(uFoamWidth * 2.5, uFoamWidth * 4.0, shore);
+            crest *= 1.0 - smoothstep(uWaveExtent * 0.5, uWaveExtent, shore);
+            return crest;
+        }
+
+        // Shoreline foam: a solid fringe hugging the waterline whose reach is
+        // scaled by drifting noise (so the edge is ragged and slowly laps),
+        // plus a detached thin outline a little further out — the classic
+        // toon-water shore treatment.
+        float foamTerm(float shore) {
+            float n = texture(uNoise,
+                vWorldPos.xz * uFoamNoiseScale + vec2(uTime * 0.03, uTime * -0.02)).r;
+            float reach = uFoamWidth * mix(0.3, 1.0, n);
+            float fringe = 1.0 - smoothstep(reach * 0.75, reach, shore);
+            // Detached outline: keep a clear gap between it and the fringe so
+            // the two never merge into one thick band.
+            float ringR = uFoamWidth * mix(1.8, 2.6, n);
+            float ring = 1.0 - smoothstep(0.02, 0.07, abs(shore - ringR));
+            return max(fringe, ring * 0.9);
+        }
+
+        void main() {
+            vec2 uv = clamp((vWorldPos.xz - uTerrainMin) / uTerrainSize, 0.0, 1.0);
+            vec2 sd = texture(uShoreTex, uv).rg;
+            float shore = sd.r * uShoreBakeRange; // world units from the waterline
+            float mask = sd.g;                    // blue-channel water coverage
+            if (mask < 0.004) discard;
+
+            // Depth-graded translucent body: real terrain depth below the
+            // waterline drives both colour and opacity, so submerged ground
+            // stays visible in the shallows and dissolves into the deep tint
+            // further down. sqrt front-loads the shallow→deep transition.
+            float ground = uHeightMin + texture(uHeightMap, uv).r * uHeightRange;
+            float depthT = sqrt(clamp((uWaterY - ground) / uDepthRange, 0.0, 1.0));
+            vec3 col = mix(uShallowColor, uDeepColor, depthT);
+            float alpha = mix(uShallowOpacity, uDeepOpacity, depthT);
+
+            float ripple = ripplesTerm(shore) * uRippleStrength;
+            col = mix(col, uRippleColor, ripple);
+            alpha = max(alpha, ripple * 0.75);
+
+            if (uWavesEnabled > 0.5) {
+                float crest = wavesTerm(shore) * 0.9;
+                col = mix(col, uFoamColor, crest);
+                alpha = max(alpha, crest * uFoamOpacity);
+            }
+
+            float foam = foamTerm(shore);
+            col = mix(col, uFoamColor, foam);
+            alpha = mix(alpha, uFoamOpacity, foam);
+
+            // Exponential-squared fog to match scene.fog (FogExp2).
+            float f = 1.0 - exp(-pow(uFogDensity * vFogDist, 2.0));
+            col = mix(col, uFogColor, clamp(f, 0.0, 1.0));
+            fragColor = vec4(col, alpha * mask);
+        }
+    `,
+});
+
+const waterGeometry = new THREE.PlaneGeometry(TERRAIN_SIZE_X, TERRAIN_SIZE_Z);
+waterGeometry.rotateX(-Math.PI / 2);
+const water = new THREE.Mesh(waterGeometry, waterMaterial);
+water.position.set(
+    TERRAIN_MIN_X + TERRAIN_SIZE_X * 0.5,
+    params.waterElevation,
+    TERRAIN_MIN_Z + TERRAIN_SIZE_Z * 0.5,
+);
+scene.add(water);
+
+// ----------------------------------------------------------------------------
 // Scattered trees — the tree1.glb model instanced across the explorable area.
 // Drawing N copies of the model as one InstancedMesh per sub-mesh costs only a
 // handful of draw calls regardless of how many trees there are, so it stays
@@ -1750,6 +2100,7 @@ window.addEventListener('resize', () => {
 
 const clock = new THREE.Clock();
 let grassWindTime = 0; // accumulated wind "localTime" (scaled by strength)
+let waterTime = 0;     // water "localTime" (scaled by flow speed)
 const moveDir = new THREE.Vector3();
 const velocity = new THREE.Vector3();
 const targetVelocity = new THREE.Vector3();
@@ -1910,6 +2261,51 @@ grassFolder.addColor(params, 'grassColorBase').name('base color')
 grassFolder.addColor(params, 'grassColorTip').name('tip color')
     .onChange((v) => grassMaterial.uniforms.uColorTip.value.set(v));
 
+const waterFolder = gui.addFolder('Water');
+const wu = waterMaterial.uniforms;
+waterFolder.add(
+    params, 'waterElevation',
+    TERRAIN_HEIGHT_MIN - 0.5, TERRAIN_HEIGHT_MAX + 0.5, 0.01,
+).name('elevation').onChange((v) => {
+    water.position.y = v;
+    wu.uWaterY.value = v;
+    bakeWaterShore(v); // the shoreline moved — recompute the distance field
+});
+waterFolder.add(params, 'waterFlowSpeed', 0, 4, 0.05).name('flow speed');
+waterFolder.addColor(params, 'waterShallowColor').name('shallow color')
+    .onChange((v) => wu.uShallowColor.value.set(v));
+waterFolder.addColor(params, 'waterDeepColor').name('deep color')
+    .onChange((v) => wu.uDeepColor.value.set(v));
+waterFolder.add(params, 'waterDepthRange', 0.05, 3, 0.05).name('depth range')
+    .onChange((v) => { wu.uDepthRange.value = v; });
+waterFolder.add(params, 'waterShallowOpacity', 0, 1, 0.01).name('shallow opacity')
+    .onChange((v) => { wu.uShallowOpacity.value = v; });
+waterFolder.add(params, 'waterDeepOpacity', 0, 1, 0.01).name('deep opacity')
+    .onChange((v) => { wu.uDeepOpacity.value = v; });
+waterFolder.addColor(params, 'waterFoamColor').name('foam color')
+    .onChange((v) => wu.uFoamColor.value.set(v));
+waterFolder.add(params, 'waterFoamOpacity', 0, 1, 0.01).name('foam opacity')
+    .onChange((v) => { wu.uFoamOpacity.value = v; });
+waterFolder.add(params, 'waterFoamWidth', 0.05, 1.5, 0.01).name('foam width')
+    .onChange((v) => { wu.uFoamWidth.value = v; });
+waterFolder.add(params, 'waterFoamNoiseScale', 0.05, 2, 0.01).name('foam raggedness')
+    .onChange((v) => { wu.uFoamNoiseScale.value = v; });
+waterFolder.addColor(params, 'waterRippleColor').name('ripple color')
+    .onChange((v) => wu.uRippleColor.value.set(v));
+waterFolder.add(params, 'waterRippleScale', 0.05, 2, 0.01).name('ripple scale')
+    .onChange((v) => { wu.uRippleScale.value = v; });
+waterFolder.add(params, 'waterRippleWidth', 0.01, 0.4, 0.005).name('ripple width')
+    .onChange((v) => { wu.uRippleWidth.value = v; });
+waterFolder.add(params, 'waterRippleStrength', 0, 1, 0.01).name('ripple strength')
+    .onChange((v) => { wu.uRippleStrength.value = v; });
+waterFolder.add(params, 'waterWavesEnabled').name('shore waves')
+    .onChange((v) => { wu.uWavesEnabled.value = v ? 1 : 0; });
+waterFolder.add(params, 'waterWaveLength', 0.2, 4, 0.05).name('wave spacing')
+    .onChange((v) => { wu.uWaveLength.value = v; });
+waterFolder.add(params, 'waterWaveSpeed', 0, 1, 0.01).name('wave speed')
+    .onChange((v) => { wu.uWaveSpeed.value = v; });
+waterFolder.add(params, 'waterWaveExtent', 0.5, 10, 0.1).name('wave extent')
+    .onChange((v) => { wu.uWaveExtent.value = v; });
 const terrainFolder = gui.addFolder('Terrain');
 terrainFolder.addColor(params, 'terrainColor').name('color').onChange((v) => {
     for (const mat of terrainMaterials) if (mat.color) mat.color.set(v);
@@ -2167,6 +2563,13 @@ function animate() {
     gu.uOrbIntensity.value = orbLight.intensity;
     gu.uFogColor.value.copy(scene.fog.color);
     gu.uFogDensity.value = scene.fog.density;
+
+    // Water: advance the ripple/foam animation and keep its fog in step with
+    // the scene fog (which the GUI can retune live).
+    waterTime += dt * params.waterFlowSpeed;
+    waterMaterial.uniforms.uTime.value = waterTime;
+    waterMaterial.uniforms.uFogColor.value.copy(scene.fog.color);
+    waterMaterial.uniforms.uFogDensity.value = scene.fog.density;
 
     // Hand the grass the orb light's live point-shadow cube + parameters so it
     // can receive shadows, and keep the caster's distance reference in sync.
