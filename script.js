@@ -339,11 +339,7 @@ const params = {
     waterFoamColor: '#000000',
     waterFoamWidth: 0.3,         // foam reach from the shore, in shore-field units
     waterFoamNoiseFrequency: 0.3,// foam edge noise scale (world XZ multiplier)
-    // Retreat both mask terms from the waterline over this many shore-field
-    // units. Nothing draws along the mesh∩plane intersection itself, hiding
-    // the low-poly faceting of that line behind the smooth field-following
-    // foam edge instead.
-    waterShoreFade: 0.3,
+    waterFoamOpacity: 1.0,       // overall strength of the shoreline foam fringe
     // Final edge fade: the ENTIRE water mask (foam + body + caustics) is
     // forced to 0 opacity exactly at the waterline and gradients back in over
     // this tiny shore-field range. The water still reaches the terrain, but
@@ -1765,7 +1761,7 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uFoamColor: { value: new THREE.Color(params.waterFoamColor) },
         uFoamWidth: { value: params.waterFoamWidth },
         uFoamNoiseFrequency: { value: params.waterFoamNoiseFrequency },
-        uShoreFade: { value: params.waterShoreFade },
+        uFoamOpacity: { value: params.waterFoamOpacity },
         uEdgeFade: { value: params.waterEdgeFade },
         uBodyColor: { value: new THREE.Color(params.waterBodyColor) },
         uBodyOpacity: { value: params.waterBodyOpacity },
@@ -1812,7 +1808,7 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uniform vec3 uFoamColor;
         uniform float uFoamWidth;
         uniform float uFoamNoiseFrequency;
-        uniform float uShoreFade;
+        uniform float uFoamOpacity;
         uniform float uEdgeFade;
         uniform vec3 uBodyColor;
         uniform float uBodyOpacity;
@@ -1848,9 +1844,9 @@ const waterMaterial = new THREE.RawShaderMaterial({
 
         // Shore foam: a fringe hugging the waterline, its outer boundary
         // displaced by noise so it's irregular, and the noise UV drifting with
-        // time so the edge slowly laps against the shore. Fades out right at
-        // the waterline (uShoreFade) so it never touches the polygonal
-        // mesh∩plane intersection line, which would trace the terrain facets.
+        // time so the edge slowly laps against the shore. uFoamOpacity scales
+        // the whole fringe; the global edge fade (see main) keeps it off the
+        // polygonal mesh∩plane intersection line.
         float foamTerm(float shore) {
             float n = texture(
                 uNoise,
@@ -1858,8 +1854,7 @@ const waterMaterial = new THREE.RawShaderMaterial({
             ).r;
             // Noise scales the reach: even at n=0 a sliver of foam survives so
             // the terrain rim stays lined; at n=1 it pushes out to full width.
-            return step(shore, uFoamWidth * mix(0.25, 1.0, n))
-                * smoothstep(0.0, uShoreFade, shore);
+            return step(shore, uFoamWidth * mix(0.25, 1.0, n)) * uFoamOpacity;
         }
 
         // Water body: translucent fill fading in from the shoreline over
@@ -2441,8 +2436,8 @@ waterFolder.add(params, 'waterFoamWidth', 0, 0.5, 0.005).name('foam width')
     .onChange((v) => { waterMaterial.uniforms.uFoamWidth.value = v; });
 waterFolder.add(params, 'waterFoamNoiseFrequency', 0.05, 4, 0.05).name('foam scale')
     .onChange((v) => { waterMaterial.uniforms.uFoamNoiseFrequency.value = v; });
-waterFolder.add(params, 'waterShoreFade', 0, 0.3, 0.005).name('shore fade')
-    .onChange((v) => { waterMaterial.uniforms.uShoreFade.value = v; });
+waterFolder.add(params, 'waterFoamOpacity', 0, 1, 0.01).name('foam opacity')
+    .onChange((v) => { waterMaterial.uniforms.uFoamOpacity.value = v; });
 waterFolder.add(params, 'waterEdgeFade', 0, 0.3, 0.005).name('edge fade')
     .onChange((v) => { waterMaterial.uniforms.uEdgeFade.value = v; });
 waterFolder.addColor(params, 'waterBodyColor').name('body color')
