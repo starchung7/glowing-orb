@@ -825,7 +825,13 @@ orb.add(orbLight);
 // Hover + bobbing — the orb floats a fixed gap above the terrain surface and
 // drifts with sine noise. Spawn at the origin, lifted to the local ground.
 const HOVER_HEIGHT = 0.3;
-const targetPos = new THREE.Vector3(0, terrainHeightAt(0, 0) + HOVER_HEIGHT, 0);
+// Orb-only collision surface: the orb treats the water plane as solid ground,
+// so over water basins it hovers on the surface instead of sinking to the
+// submerged terrain. Everything else (grass, trees, physics boxes) still uses
+// the raw terrain height.
+const orbSurfaceHeightAt = (x, z) =>
+    Math.max(terrainHeightAt(x, z), params.waterElevation);
+const targetPos = new THREE.Vector3(0, orbSurfaceHeightAt(0, 0) + HOVER_HEIGHT, 0);
 orb.position.copy(targetPos);
 const SPAWN = targetPos.clone(); // original spawn point for the boundary respawn
 
@@ -2453,7 +2459,7 @@ let jumpThrustTime = 0;          // remaining propulsion time
 let bobScaleSmooth = 1;          // eased bob amplitude factor (avoids snapping)
 
 const isGrounded = () =>
-    targetPos.y <= terrainHeightAt(targetPos.x, targetPos.z) + HOVER_HEIGHT + 1e-4;
+    targetPos.y <= orbSurfaceHeightAt(targetPos.x, targetPos.z) + HOVER_HEIGHT + 1e-4;
 
 const keyMap = {
     KeyW: 'w', ArrowUp: 'w',
@@ -2985,10 +2991,11 @@ function animate() {
     targetPos.x += velocity.x * dt;
     targetPos.z += velocity.z * dt;
 
-    // Hover level tracks the terrain surface under the orb, so it floats a fixed
-    // gap above the hills/valleys. Gravity (always applied below) pulls it down
-    // to this level each frame, letting it follow the ground as it roams.
-    const hoverY = terrainHeightAt(targetPos.x, targetPos.z) + HOVER_HEIGHT;
+    // Hover level tracks the surface under the orb (terrain, or the water
+    // plane where the terrain dips below it), so it floats a fixed gap above
+    // hills, valleys and water alike. Gravity (always applied below) pulls it
+    // down to this level each frame, letting it follow the ground as it roams.
+    const hoverY = orbSurfaceHeightAt(targetPos.x, targetPos.z) + HOVER_HEIGHT;
 
     // Propulsion phase: apply upward thrust so the launch accelerates from
     // zero instead of starting at full speed.
