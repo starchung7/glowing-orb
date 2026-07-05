@@ -580,11 +580,7 @@ const pathUniforms = {
     uShoreWetStrength: { value: params.shoreWetStrength },
 };
 
-// forceWaterMask: the depth tint normally applies only where the feature map's
-// blue channel marks water (and only inside the terrain bounds, since the map
-// doesn't exist beyond them). The infinite ocean plane passes true so the tint
-// covers it everywhere — out there, everything IS water.
-function applyPathShader(mat, forceWaterMask = false) {
+function applyPathShader(mat) {
     mat.onBeforeCompile = (shader) => {
         Object.assign(shader.uniforms, pathUniforms);
 
@@ -729,9 +725,11 @@ function applyPathShader(mat, forceWaterMask = false) {
                     vec2 wtUV = (vPathWorld.xz - uPathTerrainMin) / uPathTerrainSize;
                     float wtInside = step(0.0, wtUV.x) * step(wtUV.x, 1.0) *
                                      step(0.0, wtUV.y) * step(wtUV.y, 1.0);
-                    float wtMask = ${forceWaterMask
-                        ? '1.0'
-                        : 'waterBlue(wtUV) * wtInside'};
+                    // Inside the terrain bounds the feature map's blue channel
+                    // gates the tint; outside them the map doesn't exist and
+                    // the only geometry is the infinite ocean plane, which is
+                    // all water — so the mask is fully on out there.
+                    float wtMask = mix(1.0, waterBlue(wtUV), wtInside);
                     // Depth below the tint waterline (the real waterline plus
                     // the adjustable offset), 0 at the surface. sqrt curve
                     // front-loads the shallow→deep transition so the deep
@@ -1954,19 +1952,16 @@ scene.add(water);
 // visible. The world-boundary fog keeps the player near spawn, so a static
 // plane this large can never be out-ranged.
 const OCEAN_SIZE = 600; // fog swallows everything past ~30 units at default density
-// The plane runs the exact same material pipeline as the terrain: a Lambert
-// with the terrain base colour and the same injected shader (noise mottling,
-// depth-graded water tint, wet band, fog), so every stage matches the ground
-// it continues. The only difference is forceWaterMask: out here there's no
-// feature map, so the water tint applies unconditionally.
-const oceanMaterial = new THREE.MeshLambertMaterial({ dithering: true });
-oceanMaterial.color.set(params.terrainColor);
-applyPathShader(oceanMaterial, true);
-terrainMaterials.push(oceanMaterial); // GUI terrain-colour picker retints it too
+// The plane shares the terrain's material INSTANCE — same compiled shader,
+// same uniforms, same base colour — so its shading is pixel-identical to the
+// ground it continues. The shader's water-tint mask switches to "always on"
+// outside the terrain bounds (see applyPathShader), which is the only region
+// this plane is ever visible in.
 const ocean = new THREE.Mesh(
     new THREE.PlaneGeometry(OCEAN_SIZE, OCEAN_SIZE).rotateX(-Math.PI / 2),
-    oceanMaterial,
+    terrainMaterials[0],
 );
+ocean.receiveShadow = true; // match the terrain so shadowing doesn't diverge
 // A hair below the terrain's lowest vertex so it never z-fights the mesh.
 ocean.position.set(
     TERRAIN_MIN_X + TERRAIN_SIZE_X * 0.5,
