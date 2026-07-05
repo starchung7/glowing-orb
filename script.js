@@ -1938,6 +1938,28 @@ water.position.set(
 );
 scene.add(water);
 
+// "Infinite" ocean: an opaque plane at the terrain's lowest point, extending
+// far past the fog's visible radius so the water appears to continue forever.
+// Sitting below every terrain vertex, it needs no hole: inside the terrain
+// bounds it's hidden underneath the mesh, and beyond the rim it fills the void
+// where the ground drops away. MeshBasicMaterial respects the scene's FogExp2,
+// which uses the same 1-exp(-(density*d)^2) curve as the water shader, so both
+// dissolve into the haze identically and the plane's outer edge is never
+// visible. The world-boundary fog keeps the player near spawn, so a static
+// plane this large can never be out-ranged.
+const OCEAN_SIZE = 600; // fog swallows everything past ~30 units at default density
+const ocean = new THREE.Mesh(
+    new THREE.PlaneGeometry(OCEAN_SIZE, OCEAN_SIZE).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: params.waterBodyColor, fog: true }),
+);
+// A hair below the terrain's lowest vertex so it never z-fights the mesh.
+ocean.position.set(
+    TERRAIN_MIN_X + TERRAIN_SIZE_X * 0.5,
+    _terrainBox.min.y - 0.01,
+    TERRAIN_MIN_Z + TERRAIN_SIZE_Z * 0.5,
+);
+scene.add(ocean);
+
 // ----------------------------------------------------------------------------
 // Scattered trees — the tree1.glb model instanced across the explorable area.
 // Drawing N copies of the model as one InstancedMesh per sub-mesh costs only a
@@ -2369,7 +2391,10 @@ waterFolder.add(params, 'waterFoamNoiseFrequency', 0.05, 4, 0.05).name('foam sca
 waterFolder.add(params, 'waterShoreFade', 0, 0.3, 0.005).name('shore fade')
     .onChange((v) => { waterMaterial.uniforms.uShoreFade.value = v; });
 waterFolder.addColor(params, 'waterBodyColor').name('body color')
-    .onChange((v) => { waterMaterial.uniforms.uBodyColor.value.set(v); });
+    .onChange((v) => {
+        waterMaterial.uniforms.uBodyColor.value.set(v);
+        ocean.material.color.set(v); // the infinite ocean shares the body tint
+    });
 waterFolder.add(params, 'waterBodyOpacity', 0, 1, 0.01).name('body opacity')
     .onChange((v) => { waterMaterial.uniforms.uBodyOpacity.value = v; });
 waterFolder.add(params, 'waterBodyRange', 0.01, 1, 0.01).name('body range')
