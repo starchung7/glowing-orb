@@ -344,6 +344,12 @@ const params = {
     // the low-poly faceting of that line behind the smooth field-following
     // foam edge instead.
     waterShoreFade: 0.3,
+    // Final edge fade: the ENTIRE water mask (foam + body + caustics) is
+    // forced to 0 opacity exactly at the waterline and gradients back in over
+    // this tiny shore-field range. The water still reaches the terrain, but
+    // nothing is visible right on the mesh∩plane contact, so the low-poly
+    // intersection line never shows as a hard edge.
+    waterEdgeFade: 0.3,
     // Water body (layer 3): a translucent fill over the whole water area whose
     // edge fades in over the smooth shore-distance FIELD (not the mesh∩plane
     // line), so the low-poly terrain facets dissolve into the water colour
@@ -373,6 +379,7 @@ const params = {
     // the whole water body at low opacity (see causticsTerm in the shader).
     waterCausticsOpacity: 0.03,  // peak strength of the web (kept subtle)
     waterCausticsScale: 0.095,   // world XZ → cell-size multiplier
+    waterCausticsWobble: 1.4,    // domain-warp strength: bowing + fine wiggle of the strands
 };
 
 const scene = new THREE.Scene();
@@ -1759,11 +1766,13 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uFoamWidth: { value: params.waterFoamWidth },
         uFoamNoiseFrequency: { value: params.waterFoamNoiseFrequency },
         uShoreFade: { value: params.waterShoreFade },
+        uEdgeFade: { value: params.waterEdgeFade },
         uBodyColor: { value: new THREE.Color(params.waterBodyColor) },
         uBodyOpacity: { value: params.waterBodyOpacity },
         uBodyRange: { value: params.waterBodyRange },
         uCausticsOpacity: { value: params.waterCausticsOpacity },
         uCausticsScale: { value: params.waterCausticsScale },
+        uCausticsWobble: { value: params.waterCausticsWobble },
         uShoreDist: { value: shoreDistTexture },
         uShoreBakeRange: { value: SHORE_DIST_BAKE_RANGE },
         uShoreRange: { value: params.waterShoreRange },
@@ -1804,11 +1813,13 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uniform float uFoamWidth;
         uniform float uFoamNoiseFrequency;
         uniform float uShoreFade;
+        uniform float uEdgeFade;
         uniform vec3 uBodyColor;
         uniform float uBodyOpacity;
         uniform float uBodyRange;
         uniform float uCausticsOpacity;
         uniform float uCausticsScale;
+        uniform float uCausticsWobble;
         uniform sampler2D uShoreDist;
         uniform float uShoreBakeRange;
         uniform float uShoreRange;
@@ -1895,7 +1906,7 @@ const waterMaterial = new THREE.RawShaderMaterial({
                 texture(uNoise, p * 0.13 + vec2(uTime * 0.9, uTime * -0.4)).r,
                 texture(uNoise, p * 0.17 + vec2(uTime * -0.6, uTime * 0.8)).r
             ) - 0.23;
-            p += warp * 1.4;
+            p += warp * uCausticsWobble;
 
             vec2 cell = floor(p);
             vec2 f = fract(p);
@@ -1941,6 +1952,13 @@ const waterMaterial = new THREE.RawShaderMaterial({
             // than a hard second pattern.
             float caustics = causticsTerm(shore) * uCausticsOpacity;
             float mask = min(max(foam, body) + caustics, 1.0);
+
+            // Edge fade: force opacity to 0 exactly at the waterline and
+            // gradient back in over a very small band. The water plane still
+            // physically touches the terrain, but nothing renders right on
+            // the low-poly mesh∩plane intersection, so its faceted line
+            // dissolves instead of reading as a hard edge.
+            mask *= smoothstep(0.0, uEdgeFade, shore);
 
             // Foam wins the colour where present, then caustics, then the
             // body fill; everything dissolves into the fog.
@@ -2415,6 +2433,8 @@ waterFolder.add(params, 'waterCausticsOpacity', 0, 0.6, 0.01).name('caustics opa
     .onChange((v) => { waterMaterial.uniforms.uCausticsOpacity.value = v; });
 waterFolder.add(params, 'waterCausticsScale', 0.01, 0.3, 0.005).name('caustics scale')
     .onChange((v) => { waterMaterial.uniforms.uCausticsScale.value = v; });
+waterFolder.add(params, 'waterCausticsWobble', 0, 4, 0.05).name('caustics wobble')
+    .onChange((v) => { waterMaterial.uniforms.uCausticsWobble.value = v; });
 waterFolder.addColor(params, 'waterFoamColor').name('foam color')
     .onChange((v) => { waterMaterial.uniforms.uFoamColor.value.set(v); });
 waterFolder.add(params, 'waterFoamWidth', 0, 0.5, 0.005).name('foam width')
@@ -2423,6 +2443,8 @@ waterFolder.add(params, 'waterFoamNoiseFrequency', 0.05, 4, 0.05).name('foam sca
     .onChange((v) => { waterMaterial.uniforms.uFoamNoiseFrequency.value = v; });
 waterFolder.add(params, 'waterShoreFade', 0, 0.3, 0.005).name('shore fade')
     .onChange((v) => { waterMaterial.uniforms.uShoreFade.value = v; });
+waterFolder.add(params, 'waterEdgeFade', 0, 0.3, 0.005).name('edge fade')
+    .onChange((v) => { waterMaterial.uniforms.uEdgeFade.value = v; });
 waterFolder.addColor(params, 'waterBodyColor').name('body color')
     .onChange((v) => { waterMaterial.uniforms.uBodyColor.value.set(v); });
 waterFolder.add(params, 'waterBodyOpacity', 0, 1, 0.01).name('body opacity')
