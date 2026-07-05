@@ -376,10 +376,15 @@ const params = {
     shoreWetAbove: 0.12,     // world units above the waterline the wetness fades over
     shoreWetStrength: 0.85,  // how fully the wet colour replaces the ground tint
     waterFlowSpeed: 0.03,        // localTime advance per second
-    waterRipplesRatio: 0.44,     // 0..1 master fade (future weather hook)
-    waterSlopeFrequency: 11,     // number of bands across the shore range
-    waterNoiseFrequency: 0.385,  // wobble texture scale (world XZ multiplier)
-    waterNoiseOffset: 0.345,     // per-band noise offset divisor
+    waterRipplesRatio: 0.44,     // dash coverage: how much of each ring survives
+    waterSlopeFrequency: 11,     // number of rings across the shore range
+    waterNoiseFrequency: 0.385,  // dash/wobble texture scale (world XZ multiplier)
+    waterNoiseOffset: 0.345,     // per-ring dash-noise offset divisor
+    // Caustic web (layer 4): a soft cellular pattern drifting across the whole
+    // water body at low opacity — where two noise fields moving in different
+    // directions agree, a rounded web of light appears (cheap caustics).
+    waterCausticsOpacity: 0.14,  // peak strength of the web (kept subtle)
+    waterCausticsScale: 0.055,   // world XZ → noise UV multiplier (cell size)
 };
 
 const scene = new THREE.Scene();
@@ -1777,6 +1782,8 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uSlopeFrequency: { value: params.waterSlopeFrequency },
         uNoiseFrequency: { value: params.waterNoiseFrequency },
         uNoiseOffset: { value: params.waterNoiseOffset },
+        uCausticsOpacity: { value: params.waterCausticsOpacity },
+        uCausticsScale: { value: params.waterCausticsScale },
         uShoreDist: { value: shoreDistTexture },
         uShoreBakeRange: { value: SHORE_DIST_BAKE_RANGE },
         uShoreRange: { value: params.waterShoreRange },
@@ -1825,6 +1832,8 @@ const waterMaterial = new THREE.RawShaderMaterial({
         uniform float uSlopeFrequency;
         uniform float uNoiseFrequency;
         uniform float uNoiseOffset;
+        uniform float uCausticsOpacity;
+        uniform float uCausticsScale;
         uniform sampler2D uShoreDist;
         uniform float uShoreBakeRange;
         uniform float uShoreRange;
@@ -1851,32 +1860,58 @@ const waterMaterial = new THREE.RawShaderMaterial({
             return clamp(d / uShoreRange, 0.0, 1.0);
         }
 
-        // Contour-band ripples. The sawtooth slices the shore field into bands;
-        // per-band noise (offset by the band's integer id) wobbles each ring
-        // independently; the bias subtraction (~1.3 at the waterline, ~0 at
-        // full range) against the -0.4 threshold makes bands crowd the shore
-        // and stay IMPOSSIBLE far from it — intended look, do not "fix".
+        // Shoreline ripples: constant-thickness dashed rings drifting toward
+        // the shore. Three ingredients, each with exactly one job:
+        //   1. A sawtooth of shore distance + time slices the water into
+        //      drifting rings; the visible line sits at phase 0.5 so the
+        //      sawtooth seam (where the ring id flips and the gate noise
+        //      changes) never crosses a visible line.
+        //   2. Static noise warps the shore field slightly so the rings are
+        //      wavy instead of clean parallel contours.
+        //   3. A per-ring noise gate switches the line on/off along its
+        //      length, breaking each ring into short dashes with soft ends.
+        // Thickness is a CONSTANT in phase units. Noise only ever decides
+        // WHERE a dash shows, never how thick it is, so the old failure mode
+        // (near-shore bias + low noise inflating a line into a blob of raw
+        // noise texture, worst along the terrain rim) cannot happen here.
+        // The fractal noise texture's values are NOT 0..1: octave averaging
+        // squashes them to ~[0, 0.44] with a median near 0.23 (measured).
+        // Renormalise samples before using them as gates/wobbles here.
+        float rippleNoiseSample(vec2 uv) {
+            return clamp(texture(uNoise, uv).r * 2.2, 0.0, 1.0);
+        }
+
         float ripplesTerm(float shore) {
-            float baseRipple = (shore + uTime * 0.5) * uSlopeFrequency;
-            float rippleIndex = floor(baseRipple);
+            // (2) wavy warp, capped at ~1/4 of the ring spacing so
+            // neighbouring rings can never touch.
+            float wobble = rippleNoiseSample(vWorldPos.xz * uNoiseFrequency * 1.7) - 0.5;
+            float saw = (shore + wobble * (0.5 / uSlopeFrequency) + uTime * 0.5)
+                * uSlopeFrequency;
+            float ring = floor(saw);
+            float phase = fract(saw);
 
-            float ripplesNoise = texture(
-                uNoise,
-                (vWorldPos.xz + vec2(rippleIndex / uNoiseOffset)) * uNoiseFrequency
-            ).r;
+            // (1) fixed-width line centred at phase 0.5, edges softened by
+            // the pattern's per-pixel footprint. Where rings pack tighter
+            // than a pixel (grazing views, far distance, steep spots in the
+            // shore field) the whole pattern dissolves instead of aliasing.
+            float fw = fwidth(saw) + 0.001;
+            const float HALF_WIDTH = 0.10;
+            float line = smoothstep(0.5 - HALF_WIDTH - fw, 0.5 - HALF_WIDTH, phase)
+                * (1.0 - smoothstep(0.5 + HALF_WIDTH, 0.5 + HALF_WIDTH + fw, phase));
+            line *= 1.0 - smoothstep(0.35, 1.0, fw);
 
-            float ripples = fract(baseRipple)
-                - (1.0 - (mix(-0.3, 1.0, shore)))   // near-shore bias
-                + ripplesNoise;
+            // (3) dash gate, decorrelated per ring via the id offset. The
+            // ratio param is now literal coverage: how much of each ring
+            // survives the gate (0 = nothing, 1 = unbroken rings).
+            float gate = rippleNoiseSample(
+                (vWorldPos.xz + vec2(ring / uNoiseOffset)) * uNoiseFrequency
+            );
+            float cut = 1.0 - uRipplesRatio;
+            line *= smoothstep(cut, cut + 0.15, gate);
 
-            // TSL threshold.step(ripples) == white where ripples <= threshold.
-            float threshold = mix(-1.0, -0.4, uRipplesRatio);
-            // Retreat from the waterline (see uShoreFade note in params), and
-            // fade out past the extent cutoff — an outer LIMIT on the pattern,
-            // not a rescale of it, so band size/spacing are unaffected. The
-            // fade width (20% of extent) softens the outer boundary so bands
-            // dissolve instead of being sliced off.
-            return step(ripples, threshold)
+            // Hold off the waterline itself (foam owns that zone), fade out
+            // past the extent cutoff.
+            return line
                 * smoothstep(0.0, uShoreFade, shore)
                 * (1.0 - smoothstep(uRipplesExtent * 0.8, uRipplesExtent, shore));
         }
@@ -1905,17 +1940,39 @@ const waterMaterial = new THREE.RawShaderMaterial({
             return smoothstep(0.0, uBodyRange, shore) * uBodyOpacity;
         }
 
+        // Caustic web: two copies of the noise field drift in different
+        // directions at different scales; where their values agree, a soft
+        // rounded-cell web lights up — the classic cheap caustics trick, and
+        // the cells morph organically as the fields slide past each other.
+        // The ridge test is on the RAW samples (the texture's squashed ~0.44
+        // range just narrows the agreement band, which suits the soft look).
+        // Follows the body fade near shore so it never paints over the foam
+        // fringe or dry land.
+        float causticsTerm(float shore) {
+            vec2 p = vWorldPos.xz * uCausticsScale;
+            float n1 = texture(uNoise, p + vec2(uTime * 0.9, uTime * 0.6)).r;
+            float n2 = texture(uNoise, p * 1.27 + vec2(uTime * -0.7, uTime * 0.8)).r;
+            float web = 1.0 - smoothstep(0.0, 0.09, abs(n1 - n2));
+            web *= web; // thin the web a touch while keeping the edges soft
+            return web * smoothstep(0.0, uBodyRange, shore);
+        }
+
         void main() {
             float shore = shoreAt(vWorldPos.xz);
             // max() of mask terms — splash/ice terms join in later layers.
             float ripples = ripplesTerm(shore);
             float foam = foamTerm(shore);
             float body = bodyTerm(shore);
-            float mask = max(max(ripples, foam), body);
+            // Caustics ADD to the coverage instead of max()-ing: the web is a
+            // faint opacity boost on top of the body fill, so it reads as a
+            // brightening of the water (the plane's colour is fog-lit) rather
+            // than a hard second pattern.
+            float caustics = causticsTerm(shore) * uCausticsOpacity;
+            float mask = min(max(max(ripples, foam), body) + caustics, 1.0);
 
             // Foam wins the colour where present, then ripples, then the body
             // fill; everything dissolves into the fog.
-            vec3 baseCol = mix(uBodyColor, uColor, ripples);
+            vec3 baseCol = mix(uBodyColor, uColor, max(ripples, caustics));
             baseCol = mix(baseCol, uFoamColor, foam);
             float f = 1.0 - exp(-pow(uFogDensity * vFogDist, 2.0));
             vec3 col = mix(baseCol, uFogColor, clamp(f, 0.0, 1.0));
@@ -2392,6 +2449,10 @@ waterFolder.add(params, 'waterNoiseFrequency', 0.01, 1, 0.005).name('wobble scal
     .onChange((v) => { waterMaterial.uniforms.uNoiseFrequency.value = v; });
 waterFolder.add(params, 'waterNoiseOffset', 0.05, 2, 0.005).name('wobble offset')
     .onChange((v) => { waterMaterial.uniforms.uNoiseOffset.value = v; });
+waterFolder.add(params, 'waterCausticsOpacity', 0, 0.6, 0.01).name('caustics opacity')
+    .onChange((v) => { waterMaterial.uniforms.uCausticsOpacity.value = v; });
+waterFolder.add(params, 'waterCausticsScale', 0.01, 0.3, 0.005).name('caustics scale')
+    .onChange((v) => { waterMaterial.uniforms.uCausticsScale.value = v; });
 waterFolder.addColor(params, 'waterFoamColor').name('foam color')
     .onChange((v) => { waterMaterial.uniforms.uFoamColor.value.set(v); });
 waterFolder.add(params, 'waterFoamWidth', 0, 0.5, 0.005).name('foam width')
