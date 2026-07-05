@@ -344,7 +344,7 @@ const params = {
     // Shore foam (layer 2): an irregular fringe hugging the waterline, its
     // outer edge displaced by drifting noise so it reads as lapping foam.
     waterFoamColor: '#000000',
-    waterFoamWidth: 0.19,        // foam reach from the shore, in shore-field units
+    waterFoamWidth: 0.3,         // foam reach from the shore, in shore-field units
     waterFoamNoiseFrequency: 0.3,// foam edge noise scale (world XZ multiplier)
     // Retreat both mask terms from the waterline over this many shore-field
     // units. Nothing draws along the mesh∩plane intersection itself, hiding
@@ -380,11 +380,10 @@ const params = {
     waterSlopeFrequency: 11,     // number of rings across the shore range
     waterNoiseFrequency: 0.385,  // dash/wobble texture scale (world XZ multiplier)
     waterNoiseOffset: 0.345,     // per-ring dash-noise offset divisor
-    // Caustic web (layer 4): a soft cellular pattern drifting across the whole
-    // water body at low opacity — where two noise fields moving in different
-    // directions agree, a rounded web of light appears (cheap caustics).
-    waterCausticsOpacity: 0.14,  // peak strength of the web (kept subtle)
-    waterCausticsScale: 0.055,   // world XZ → noise UV multiplier (cell size)
+    // Caustic web (layer 4): a Worley-noise cell-border web drifting across
+    // the whole water body at low opacity (see causticsTerm in the shader).
+    waterCausticsOpacity: 0.03,  // peak strength of the web (kept subtle)
+    waterCausticsScale: 0.095,   // world XZ → cell-size multiplier
 };
 
 const scene = new THREE.Scene();
@@ -1940,20 +1939,73 @@ const waterMaterial = new THREE.RawShaderMaterial({
             return smoothstep(0.0, uBodyRange, shore) * uBodyOpacity;
         }
 
-        // Caustic web: two copies of the noise field drift in different
-        // directions at different scales; where their values agree, a soft
-        // rounded-cell web lights up — the classic cheap caustics trick, and
-        // the cells morph organically as the fields slide past each other.
-        // The ridge test is on the RAW samples (the texture's squashed ~0.44
-        // range just narrows the agreement band, which suits the soft look).
-        // Follows the body fade near shore so it never paints over the foam
-        // fringe or dry land.
+        // Cartoon Worley caustics: one feature point per grid cell, each
+        // orbiting its cell on its own phase, and the web drawn where the
+        // distances to the two nearest points nearly tie (F2 - F1 ~ 0) —
+        // i.e. exactly along the Voronoi cell borders. That gives the
+        // rounded-cell caustic look, and the orbiting points make the cells
+        // squash and trade territory organically. A hard-ish smoothstep on
+        // the border metric keeps the lines flat and graphic (toon style)
+        // rather than photoreal shimmer.
+        vec2 causticsHash(vec2 cell) {
+            vec2 h = vec2(
+                dot(cell, vec2(127.1, 311.7)),
+                dot(cell, vec2(269.5, 183.3))
+            );
+            return fract(sin(h) * 43758.5453);
+        }
+
         float causticsTerm(float shore) {
-            vec2 p = vWorldPos.xz * uCausticsScale;
-            float n1 = texture(uNoise, p + vec2(uTime * 0.9, uTime * 0.6)).r;
-            float n2 = texture(uNoise, p * 1.27 + vec2(uTime * -0.7, uTime * 0.8)).r;
-            float web = 1.0 - smoothstep(0.0, 0.09, abs(n1 - n2));
-            web *= web; // thin the web a touch while keeping the edges soft
+            // The scale param is kept compatible with the old texture-based
+            // look: one Worley cell spans roughly what one noise feature did.
+            vec2 p = vWorldPos.xz * uCausticsScale * 24.0;
+
+            // Natural wobble: warp the lookup domain with two drifting
+            // fractal-noise channels BEFORE the cell search. Voronoi borders
+            // are straight perpendicular bisectors meeting at sharp
+            // junctions; bending the space they live in curves them into
+            // meandering strands and rounds the junctions — the single
+            // biggest step from "diagram" to "water". Warp features are
+            // roughly cell-sized so borders bow without shattering, and the
+            // two channels drift on different headings so the wobble itself
+            // slowly changes shape. (Noise values centre near 0.23, see
+            // rippleNoiseSample — subtract that, not 0.5.)
+            vec2 warp = vec2(
+                texture(uNoise, p * 0.13 + vec2(uTime * 0.9, uTime * -0.4)).r,
+                texture(uNoise, p * 0.17 + vec2(uTime * -0.6, uTime * 0.8)).r
+            ) - 0.23;
+            p += warp * 1.4;
+
+            vec2 cell = floor(p);
+            vec2 f = fract(p);
+
+            // Distances to the nearest (f1) and second-nearest (f2) feature
+            // points over the 3x3 neighbourhood.
+            float f1 = 8.0;
+            float f2 = 8.0;
+            for (int y = -1; y <= 1; y++) {
+                for (int x = -1; x <= 1; x++) {
+                    vec2 g = vec2(float(x), float(y));
+                    vec2 rnd = causticsHash(cell + g);
+                    // Each point orbits its cell centre; radius stays < 0.5
+                    // so points never leave their cell (keeps the 3x3 search
+                    // exact and the cells evenly sized).
+                    vec2 o = 0.5 + 0.35 * sin(uTime * 8.0 + rnd * 6.2831853);
+                    float d = length(g + o - f);
+                    if (d < f1) { f2 = f1; f1 = d; }
+                    else if (d < f2) { f2 = d; }
+                }
+            }
+
+            // Border metric: 0 on a cell edge, growing toward cell interiors.
+            // The smoothstep window sets the line thickness (kept narrow for
+            // fine strands); squaring flattens the falloff into an
+            // evenly-weighted stroke. fwidth keeps the edge a pixel soft so
+            // distance/grazing views don't sparkle.
+            float border = f2 - f1;
+            float aa = fwidth(p.x + p.y) * 0.7;
+            float web = 1.0 - smoothstep(0.02, 0.11 + aa, border);
+            web *= web;
             return web * smoothstep(0.0, uBodyRange, shore);
         }
 
