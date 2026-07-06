@@ -362,8 +362,8 @@ const params = {
     // elevation so it always lines up with the water plane, shore foam and
     // caustics. Pure texturing — the "water" is the ground.
     waterTintEnabled: true,
-    waterTintShallowColor: '#3a4f6e',
-    waterTintDeepColor: '#101b30',
+    waterTintShallowColor: '#9493d2',
+    waterTintDeepColor: '#584b86',
     waterTintDepthRange: 0.35,  // world units below the tint waterline to reach the deep colour
     waterTintStrength: 1.0,     // how fully the tint replaces the ground colour
     waterTintLevel: 0.0,        // tint waterline offset above the actual water elevation
