@@ -334,6 +334,12 @@ const params = {
     lilyPadVertices: 22,          // rim vertex count (roundness of the circle)
     lilyPadCrinkle: 0.06,         // random rim-vertex lift (leafy crinkle amount)
     lilyPadSeed: 7,               // reseed to reshuffle the layout
+    // Simple flower on some pads: rounded-triangle petals fanned around the
+    // pad's center, tilted gently upward.
+    lilyFlowerColor: '#e56ab3',   // petal pink
+    lilyFlowerChance: 0.3,        // fraction of pads that grow a flower
+    lilyFlowerScale: 0.45,        // flower radius as a fraction of its pad's radius
+    lilyFlowerPetals: 6,          // petals fanned around the center
     // World boundary: roam too far from spawn and a thick fog rolls in and
     // whisks you back. Radial (distance from spawn), not tied to the plane edges.
     boundaryEnabled: true,
@@ -2207,6 +2213,46 @@ function makeLilyPadGeometry(withSlit, segments, crinkle, rng) {
     return geo;
 }
 
+// A unit-radius flower: rounded-triangle petals fanned around the origin,
+// each petal a fan from its base to a 3-point arc at the tip (the rounding),
+// tilted upward so the flower opens like a shallow cup.
+function makeLilyFlowerGeometry(petalCount) {
+    const positions = [];
+    const indices = [];
+    const TILT = 0.7;       // how much petal tips rise per unit of radius
+    // Petal half-width exactly fills the ring, so adjacent petals' side
+    // points touch and the flower reads as one connected bloom.
+    const HALF_W = Math.PI / petalCount;
+    for (let p = 0; p < petalCount; p++) {
+        const dir = (p / petalCount) * Math.PI * 2;
+        const base = positions.length / 3;
+        // All petals share the flower's center point, so they connect.
+        positions.push(0, 0, 0);
+        // Rounded tip: three arc points across the outer end of the petal,
+        // the middle one pushed furthest out.
+        const arcAngles = [-HALF_W, 0, HALF_W];
+        for (const off of arcAngles) {
+            const a = dir + off;
+            const r = off === 0 ? 1 : 0.78;
+            positions.push(Math.cos(a) * r, r * TILT, Math.sin(a) * r);
+        }
+        indices.push(base, base + 2, base + 1, base, base + 3, base + 2);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.setIndex(indices);
+    geo.computeVertexNormals();
+    return geo;
+}
+
+const lilyFlowerMaterial = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(params.lilyFlowerColor),
+    roughness: 0.7,
+    metalness: 0,
+    flatShading: true,
+    side: THREE.DoubleSide, // petals are single-sided fins; show both faces
+});
+
 const lilyPadMaterial = new THREE.MeshStandardMaterial({
     color: new THREE.Color(params.lilyPadColor),
     roughness: 0.85,
@@ -2255,7 +2301,7 @@ function buildLilyPads() {
 
     // Scatter pads around each center, re-validating every pad so none pokes
     // onto dry land, and split them between the two variants.
-    const slitMatrices = [], fullMatrices = [];
+    const slitMatrices = [], fullMatrices = [], flowerMatrices = [];
     const placed = []; // every accepted pad's {x, z, size}, for overlap checks
     for (const c of clusters) {
         const n = Math.max(1, Math.round(
@@ -2295,6 +2341,15 @@ function buildLilyPads() {
                 _padMatrix.compose(_padPos, _padQuat, _padScale);
                 const list = rng() < params.lilyPadSlitFraction ? slitMatrices : fullMatrices;
                 list.push(_padMatrix.clone());
+                // Some pads grow a flower at their center, sized to the pad.
+                if (rng() < params.lilyFlowerChance) {
+                    const fs = size * params.lilyFlowerScale;
+                    _padPos.set(x, surfaceY + size * params.lilyPadCrinkle + 0.003, z);
+                    _padQuat.setFromAxisAngle(_padUp, rng() * Math.PI * 2);
+                    _padScale.set(fs, fs, fs);
+                    _padMatrix.compose(_padPos, _padQuat, _padScale);
+                    flowerMatrices.push(_padMatrix.clone());
+                }
                 break;
             }
         }
@@ -2311,6 +2366,17 @@ function buildLilyPads() {
         inst.receiveShadow = params.sceneShadowsEnabled;
         inst.frustumCulled = false;
         for (let i = 0; i < matrices.length; i++) inst.setMatrixAt(i, matrices[i]);
+        inst.instanceMatrix.needsUpdate = true;
+        lilyPadGroup.add(inst);
+    }
+
+    if (flowerMatrices.length > 0) {
+        const petals = Math.max(3, Math.floor(params.lilyFlowerPetals));
+        const geo = makeLilyFlowerGeometry(petals);
+        const inst = new THREE.InstancedMesh(geo, lilyFlowerMaterial, flowerMatrices.length);
+        inst.receiveShadow = params.sceneShadowsEnabled;
+        inst.frustumCulled = false;
+        for (let i = 0; i < flowerMatrices.length; i++) inst.setMatrixAt(i, flowerMatrices[i]);
         inst.instanceMatrix.needsUpdate = true;
         lilyPadGroup.add(inst);
     }
@@ -2756,6 +2822,14 @@ lilyFolder.add(params, 'lilyPadVertices', 3, 64, 1).name('vertices')
 lilyFolder.add(params, 'lilyPadCrinkle', 0, 0.3, 0.005).name('crinkle')
     .onFinishChange(buildLilyPads);
 lilyFolder.add(params, 'lilyPadSeed', 0, 100, 1).name('seed')
+    .onFinishChange(buildLilyPads);
+lilyFolder.addColor(params, 'lilyFlowerColor').name('flower color')
+    .onChange((v) => { lilyFlowerMaterial.color.set(v); });
+lilyFolder.add(params, 'lilyFlowerChance', 0, 1, 0.05).name('flower chance')
+    .onFinishChange(buildLilyPads);
+lilyFolder.add(params, 'lilyFlowerScale', 0.1, 1, 0.05).name('flower size')
+    .onFinishChange(buildLilyPads);
+lilyFolder.add(params, 'lilyFlowerPetals', 3, 12, 1).name('flower petals')
     .onFinishChange(buildLilyPads);
 
 const dofFolder = gui.addFolder('Depth of Field');
