@@ -318,6 +318,20 @@ const params = {
     treeHeight: 1.25,         // target world height the model is normalised to
     treeAreaRadius: 21,       // trees scatter within this radius of spawn
     treeClearing: 4,          // keep a clear circle around spawn (no trees)
+    // Procedural low-poly lily pads, instanced in clusters hugging the
+    // shoreline (placed via the baked shore-distance field). Two variants:
+    // a full disc and one with the classic wedge slit cut out of it.
+    lilyPadEnabled: true,
+    lilyPadColor: '#150632',      // dark purple
+    lilyPadClusterCount: 14,      // shoreline clusters to attempt
+    lilyPadsPerCluster: 6,        // average pads per cluster (±40% jitter)
+    lilyPadClusterRadius: 0.45,   // world-units spread of a cluster
+    lilyPadMinSize: 0.05,         // smallest pad radius (world units)
+    lilyPadMaxSize: 0.125,        // largest pad radius (world units)
+    lilyPadShoreDistance: 0.9,    // max distance from the waterline (world units)
+    lilyPadSlitFraction: 0.5,     // share of pads using the slit variant
+    lilyPadVertices: 22,          // rim vertex count (roundness of the circle)
+    lilyPadSeed: 7,               // reseed to reshuffle the layout
     // World boundary: roam too far from spawn and a thick fog rolls in and
     // whisks you back. Radial (distance from spawn), not tied to the plane edges.
     boundaryEnabled: true,
@@ -2100,6 +2114,148 @@ new GLTFLoader().load(treeUrl, (gltf) => {
     buildTrees();
 });
 
+// ----------------------------------------------------------------------------
+// Lily pads — procedural low-poly discs floating on the water, clustered
+// along the shoreline. Placement samples the same baked shore-distance field
+// the water shader uses, so pads always hug the current waterline. Two
+// geometry variants (full disc / wedge slit), each drawn as one InstancedMesh.
+// ----------------------------------------------------------------------------
+const lilyPadGroup = new THREE.Group();
+scene.add(lilyPadGroup);
+
+// Deterministic RNG (mulberry32) so the seed slider reshuffles reproducibly.
+function makeRng(seed) {
+    let a = seed >>> 0;
+    return function () {
+        a |= 0; a = (a + 0x6D2B79F5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// Shore distance in world units at an XZ (bilinear over the baked field).
+// 0 on dry land AND exactly at the waterline; grows into the water.
+function shoreDistanceAt(x, z) {
+    const fx = ((x - TERRAIN_MIN_X) / TERRAIN_SIZE_X) * (HMAP_RES - 1);
+    const fz = ((z - TERRAIN_MIN_Z) / TERRAIN_SIZE_Z) * (HMAP_RES - 1);
+    const cx = Math.min(HMAP_RES - 1, Math.max(0, fx));
+    const cz = Math.min(HMAP_RES - 1, Math.max(0, fz));
+    const x0 = Math.floor(cx), z0 = Math.floor(cz);
+    const x1 = Math.min(HMAP_RES - 1, x0 + 1), z1 = Math.min(HMAP_RES - 1, z0 + 1);
+    const tx = cx - x0, tz = cz - z0;
+    const d00 = _shoreDist[z0 * HMAP_RES + x0], d10 = _shoreDist[z0 * HMAP_RES + x1];
+    const d01 = _shoreDist[z1 * HMAP_RES + x0], d11 = _shoreDist[z1 * HMAP_RES + x1];
+    const a = d00 + (d10 - d00) * tx;
+    const b = d01 + (d11 - d01) * tx;
+    const cellWorld = 0.5 * (TERRAIN_SIZE_X + TERRAIN_SIZE_Z) / (HMAP_RES - 1);
+    return (a + (b - a) * tz) * cellWorld;
+}
+
+// A unit-radius flat circular pad: a regular triangle fan whose roundness is
+// set by the vertex-count slider. The slit variant leaves a wedge of the fan
+// uncovered (the classic lily-pad notch); the plain variant is a full circle.
+function makeLilyPadGeometry(withSlit, segments) {
+    const slitHalf = withSlit ? 0.38 : 0; // half-angle of the missing wedge
+    const start = slitHalf, end = Math.PI * 2 - slitHalf;
+    const positions = [0, 0, 0]; // center vertex
+    for (let i = 0; i <= segments; i++) {
+        const a = start + (end - start) * (i / segments);
+        positions.push(Math.cos(a), 0, Math.sin(a));
+    }
+    const indices = [];
+    for (let i = 1; i <= segments; i++) indices.push(0, i + 1, i);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.setIndex(indices);
+    geo.computeVertexNormals();
+    return geo;
+}
+
+const lilyPadMaterial = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(params.lilyPadColor),
+    roughness: 0.85,
+    metalness: 0,
+    flatShading: true,
+    side: THREE.DoubleSide, // flat discs stay visible from below the surface too
+});
+
+const _padPos = new THREE.Vector3();
+const _padQuat = new THREE.Quaternion();
+const _padScale = new THREE.Vector3();
+const _padUp = new THREE.Vector3(0, 1, 0);
+const _padMatrix = new THREE.Matrix4();
+
+function buildLilyPads() {
+    for (let i = lilyPadGroup.children.length - 1; i >= 0; i--) {
+        const child = lilyPadGroup.children[i];
+        child.geometry.dispose();
+        lilyPadGroup.remove(child);
+    }
+    if (!params.lilyPadEnabled) return;
+
+    const rng = makeRng(Math.floor(params.lilyPadSeed));
+    const surfaceY = params.waterElevation + 0.004; // just above the water plane
+
+    // Find cluster centers: rejection-sample points across the terrain and keep
+    // the ones sitting in shallow water within lilyPadShoreDistance of a shore.
+    const clusters = [];
+    const wanted = Math.max(0, Math.floor(params.lilyPadClusterCount));
+    for (let tries = 0; tries < wanted * 400 && clusters.length < wanted; tries++) {
+        const x = TERRAIN_MIN_X + rng() * TERRAIN_SIZE_X;
+        const z = TERRAIN_MIN_Z + rng() * TERRAIN_SIZE_Z;
+        if (terrainHeightAt(x, z) >= params.waterElevation) continue; // dry land
+        const d = shoreDistanceAt(x, z);
+        if (d < 0.05 || d > params.lilyPadShoreDistance) continue;
+        // Keep clusters apart so they read as separate patches, not one carpet.
+        const minGap = params.lilyPadClusterRadius * 3;
+        let crowded = false;
+        for (const c of clusters) {
+            const dx = c.x - x, dz = c.z - z;
+            if (dx * dx + dz * dz < minGap * minGap) { crowded = true; break; }
+        }
+        if (!crowded) clusters.push({ x, z });
+    }
+
+    // Scatter pads around each center, re-validating every pad so none pokes
+    // onto dry land, and split them between the two variants.
+    const slitMatrices = [], fullMatrices = [];
+    for (const c of clusters) {
+        const n = Math.max(1, Math.round(
+            params.lilyPadsPerCluster * (0.6 + rng() * 0.8),
+        ));
+        for (let i = 0; i < n; i++) {
+            const a = rng() * Math.PI * 2;
+            const r = Math.sqrt(rng()) * params.lilyPadClusterRadius;
+            const x = c.x + Math.cos(a) * r;
+            const z = c.z + Math.sin(a) * r;
+            if (terrainHeightAt(x, z) >= params.waterElevation) continue;
+            if (shoreDistanceAt(x, z) > params.lilyPadShoreDistance * 1.4) continue;
+            const size = params.lilyPadMinSize +
+                rng() * Math.max(0, params.lilyPadMaxSize - params.lilyPadMinSize);
+            _padPos.set(x, surfaceY, z);
+            _padQuat.setFromAxisAngle(_padUp, rng() * Math.PI * 2);
+            _padScale.set(size, size, size);
+            _padMatrix.compose(_padPos, _padQuat, _padScale);
+            const list = rng() < params.lilyPadSlitFraction ? slitMatrices : fullMatrices;
+            list.push(_padMatrix.clone());
+        }
+    }
+
+    for (const [withSlit, matrices] of [[true, slitMatrices], [false, fullMatrices]]) {
+        if (matrices.length === 0) continue;
+        const segments = Math.max(3, Math.floor(params.lilyPadVertices));
+        const geo = makeLilyPadGeometry(withSlit, segments);
+        const inst = new THREE.InstancedMesh(geo, lilyPadMaterial, matrices.length);
+        inst.receiveShadow = params.sceneShadowsEnabled;
+        inst.frustumCulled = false;
+        for (let i = 0; i < matrices.length; i++) inst.setMatrixAt(i, matrices[i]);
+        inst.instanceMatrix.needsUpdate = true;
+        lilyPadGroup.add(inst);
+    }
+}
+buildLilyPads();
+
 // 3/4 view: above the orb, tilted forward
 const cameraOffset = new THREE.Vector3(0, 1.8, 1.8);
 
@@ -2406,6 +2562,7 @@ waterFolder.add(
     water.position.y = v;
     bakeShoreDistance(v); // the shoreline moved — recompute the distance field
     pathUniforms.uWaterLevel.value = v; // keep the terrain wet band on the line
+    buildLilyPads(); // pads float on the surface, so follow the new waterline
 });
 waterFolder.addColor(params, 'waterColor').name('color')
     .onChange((v) => { waterMaterial.uniforms.uColor.value.set(v); });
@@ -2512,6 +2669,29 @@ treeFolder.add(params, 'treeAreaRadius', 5, 40, 1).name('area radius')
     .onFinishChange(buildTrees);
 treeFolder.add(params, 'treeClearing', 0, 20, 0.5).name('clearing')
     .onFinishChange(buildTrees);
+
+const lilyFolder = gui.addFolder('Lily Pads');
+lilyFolder.add(params, 'lilyPadEnabled').name('enabled').onChange(buildLilyPads);
+lilyFolder.addColor(params, 'lilyPadColor').name('color')
+    .onChange((v) => { lilyPadMaterial.color.set(v); });
+lilyFolder.add(params, 'lilyPadClusterCount', 0, 60, 1).name('clusters')
+    .onFinishChange(buildLilyPads);
+lilyFolder.add(params, 'lilyPadsPerCluster', 1, 20, 1).name('pads per cluster')
+    .onFinishChange(buildLilyPads);
+lilyFolder.add(params, 'lilyPadClusterRadius', 0.1, 2, 0.05).name('cluster radius')
+    .onFinishChange(buildLilyPads);
+lilyFolder.add(params, 'lilyPadMinSize', 0.02, 0.5, 0.005).name('min size')
+    .onFinishChange(buildLilyPads);
+lilyFolder.add(params, 'lilyPadMaxSize', 0.02, 0.8, 0.005).name('max size')
+    .onFinishChange(buildLilyPads);
+lilyFolder.add(params, 'lilyPadShoreDistance', 0.1, 5, 0.05).name('shore distance')
+    .onFinishChange(buildLilyPads);
+lilyFolder.add(params, 'lilyPadSlitFraction', 0, 1, 0.05).name('slit fraction')
+    .onFinishChange(buildLilyPads);
+lilyFolder.add(params, 'lilyPadVertices', 3, 64, 1).name('vertices')
+    .onFinishChange(buildLilyPads);
+lilyFolder.add(params, 'lilyPadSeed', 0, 100, 1).name('seed')
+    .onFinishChange(buildLilyPads);
 
 const dofFolder = gui.addFolder('Depth of Field');
 dofFolder.add(params, 'dofBlur', 0, 8, 0.1).name('edge blur').onChange((v) => {
