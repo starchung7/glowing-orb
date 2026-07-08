@@ -322,7 +322,7 @@ const params = {
     // shoreline (placed via the baked shore-distance field). Two variants:
     // a full disc and one with the classic wedge slit cut out of it.
     lilyPadEnabled: true,
-    lilyPadColor: '#150632',      // dark purple
+    lilyPadColor: '#322843',      // dark purple
     lilyPadClusterCount: 18,      // shoreline clusters to attempt
     lilyPadsPerCluster: 6,        // average pads per cluster (±40% jitter)
     lilyPadClusterRadius: 0.45,   // world-units spread of a cluster
@@ -2259,18 +2259,17 @@ function makeLilyFlowerGeometry(petalCount, rng) {
     return geo;
 }
 
-const lilyFlowerMaterial = new THREE.MeshStandardMaterial({
+// Lambert (like the terrain) rather than Standard/PBR: no specular lobe and a
+// gentler diffuse response, so the pads don't catch the orb's light harder
+// than the ground they float beside.
+const lilyFlowerMaterial = new THREE.MeshLambertMaterial({
     color: new THREE.Color(params.lilyFlowerColor),
-    roughness: 0.7,
-    metalness: 0,
     flatShading: true,
     side: THREE.DoubleSide, // petals are single-sided fins; show both faces
 });
 
-const lilyPadMaterial = new THREE.MeshStandardMaterial({
+const lilyPadMaterial = new THREE.MeshLambertMaterial({
     color: new THREE.Color(params.lilyPadColor),
-    roughness: 0.85,
-    metalness: 0,
     flatShading: true,
     side: THREE.DoubleSide, // flat discs stay visible from below the surface too
 });
