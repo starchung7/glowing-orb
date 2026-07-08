@@ -336,7 +336,7 @@ const params = {
     lilyPadSeed: 7,               // reseed to reshuffle the layout
     // Simple flower on some pads: rounded-triangle petals fanned around the
     // pad's center, tilted gently upward.
-    lilyFlowerColor: '#e56ab3',   // petal pink
+    lilyFlowerColor: '#cf6ea8',   // petal pink
     lilyFlowerChance: 0.3,        // fraction of pads that grow a flower
     lilyFlowerScale: 0.45,        // flower radius as a fraction of its pad's radius
     lilyFlowerPetals: 6,          // petals fanned around the center
@@ -2213,30 +2213,44 @@ function makeLilyPadGeometry(withSlit, segments, crinkle, rng) {
     return geo;
 }
 
-// A unit-radius flower: rounded-triangle petals fanned around the origin,
-// each petal a fan from its base to a 3-point arc at the tip (the rounding),
-// tilted upward so the flower opens like a shallow cup.
-function makeLilyFlowerGeometry(petalCount) {
+// A unit-radius flower: triangular petals fanned around the origin, each one
+// tapering from the shared center point and capped by a semicircular arc at
+// its outer (upward facing) end, tilted upward so the flower opens like a
+// cup. Each petal is a 2D shape in its own (u = outward, v = across) plane —
+// a triangle plus a half-circle — mapped into 3D with the lift growing along
+// the petal's length.
+function makeLilyFlowerGeometry(petalCount, rng) {
     const positions = [];
     const indices = [];
-    const TILT = 0.7;       // how much petal tips rise per unit of radius
-    // Petal half-width exactly fills the ring, so adjacent petals' side
-    // points touch and the flower reads as one connected bloom.
-    const HALF_W = Math.PI / petalCount;
+    const HALF_W = Math.sin(Math.PI / petalCount) * 0.7; // petal half-width
+    const ARC_STEPS = 6;              // segments in the rounded cap
     for (let p = 0; p < petalCount; p++) {
         const dir = (p / petalCount) * Math.PI * 2;
+        // Per-petal irregularity: each petal gets its own length and a
+        // slightly different upward tilt, so the bloom looks hand-grown
+        // rather than machine-stamped.
+        const len = 0.85 + rng() * 0.45;    // petal reach (0.85–1.3)
+        const tilt = 0.45 + rng() * 0.3;    // lift per unit of petal length
+        const rectLen = Math.max(0.05, len - HALF_W); // arc cap reaches u = len
+        const ru = Math.cos(dir), rv = Math.sin(dir);   // outward direction
+        const pu = -Math.sin(dir), pv = Math.cos(dir);  // across direction
         const base = positions.length / 3;
-        // All petals share the flower's center point, so they connect.
-        positions.push(0, 0, 0);
-        // Rounded tip: three arc points across the outer end of the petal,
-        // the middle one pushed furthest out.
-        const arcAngles = [-HALF_W, 0, HALF_W];
-        for (const off of arcAngles) {
-            const a = dir + off;
-            const r = off === 0 ? 1 : 0.78;
-            positions.push(Math.cos(a) * r, r * TILT, Math.sin(a) * r);
+        const push = (u, v) => positions.push(
+            ru * u + pu * v,
+            u * tilt,
+            rv * u + pv * v,
+        );
+        // Triangle petal: both sides taper from the shared center point out
+        // to the rounded tip — a semicircular arc capping the triangle, the
+        // same rounding the rectangles had.
+        push(0, 0);
+        for (let i = 0; i <= ARC_STEPS; i++) {
+            const t = -Math.PI / 2 + (i / ARC_STEPS) * Math.PI;
+            push(rectLen + Math.cos(t) * HALF_W, Math.sin(t) * HALF_W);
         }
-        indices.push(base, base + 2, base + 1, base, base + 3, base + 2);
+        for (let i = 1; i <= ARC_STEPS; i++) {
+            indices.push(base, base + i + 1, base + i);
+        }
     }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
@@ -2344,7 +2358,10 @@ function buildLilyPads() {
                 // Some pads grow a flower at their center, sized to the pad.
                 if (rng() < params.lilyFlowerChance) {
                     const fs = size * params.lilyFlowerScale;
-                    _padPos.set(x, surfaceY + size * params.lilyPadCrinkle + 0.003, z);
+                    // Sink the flower slightly into the pad so the petals'
+                    // overlapping bases are hidden beneath the leaf instead of
+                    // visibly clipping through each other at the center.
+                    _padPos.set(x, surfaceY + size * params.lilyPadCrinkle - fs * 0.15, z);
                     _padQuat.setFromAxisAngle(_padUp, rng() * Math.PI * 2);
                     _padScale.set(fs, fs, fs);
                     _padMatrix.compose(_padPos, _padQuat, _padScale);
@@ -2372,7 +2389,7 @@ function buildLilyPads() {
 
     if (flowerMatrices.length > 0) {
         const petals = Math.max(3, Math.floor(params.lilyFlowerPetals));
-        const geo = makeLilyFlowerGeometry(petals);
+        const geo = makeLilyFlowerGeometry(petals, makeRng(303));
         const inst = new THREE.InstancedMesh(geo, lilyFlowerMaterial, flowerMatrices.length);
         inst.receiveShadow = params.sceneShadowsEnabled;
         inst.frustumCulled = false;
