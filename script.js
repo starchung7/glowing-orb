@@ -2254,25 +2254,41 @@ function buildLilyPads() {
     // Scatter pads around each center, re-validating every pad so none pokes
     // onto dry land, and split them between the two variants.
     const slitMatrices = [], fullMatrices = [];
+    const placed = []; // every accepted pad's {x, z, size}, for overlap checks
     for (const c of clusters) {
         const n = Math.max(1, Math.round(
             params.lilyPadsPerCluster * (0.6 + rng() * 0.8),
         ));
         for (let i = 0; i < n; i++) {
-            const a = rng() * Math.PI * 2;
-            const r = Math.sqrt(rng()) * params.lilyPadClusterRadius;
-            const x = c.x + Math.cos(a) * r;
-            const z = c.z + Math.sin(a) * r;
-            if (terrainHeightAt(x, z) >= params.waterElevation) continue;
-            if (shoreDistanceAt(x, z) > params.lilyPadShoreDistance * 1.4) continue;
-            const size = params.lilyPadMinSize +
-                rng() * Math.max(0, params.lilyPadMaxSize - params.lilyPadMinSize);
-            _padPos.set(x, surfaceY, z);
-            _padQuat.setFromAxisAngle(_padUp, rng() * Math.PI * 2);
-            _padScale.set(size, size, size);
-            _padMatrix.compose(_padPos, _padQuat, _padScale);
-            const list = rng() < params.lilyPadSlitFraction ? slitMatrices : fullMatrices;
-            list.push(_padMatrix.clone());
+            // Each pad gets several placement attempts; if every spot within
+            // the cluster would overlap an existing pad, the pad is dropped.
+            for (let attempt = 0; attempt < 8; attempt++) {
+                const a = rng() * Math.PI * 2;
+                const r = Math.sqrt(rng()) * params.lilyPadClusterRadius;
+                const x = c.x + Math.cos(a) * r;
+                const z = c.z + Math.sin(a) * r;
+                if (terrainHeightAt(x, z) >= params.waterElevation) continue;
+                if (shoreDistanceAt(x, z) > params.lilyPadShoreDistance * 1.4) continue;
+                const size = params.lilyPadMinSize +
+                    rng() * Math.max(0, params.lilyPadMaxSize - params.lilyPadMinSize);
+                // No overlap: keep at least the two pads' radii between
+                // centers (pad geometry is a unit-radius disc scaled by size).
+                let overlaps = false;
+                for (const p of placed) {
+                    const dx = p.x - x, dz = p.z - z;
+                    const minDist = p.size + size;
+                    if (dx * dx + dz * dz < minDist * minDist) { overlaps = true; break; }
+                }
+                if (overlaps) continue;
+                placed.push({ x, z, size });
+                _padPos.set(x, surfaceY, z);
+                _padQuat.setFromAxisAngle(_padUp, rng() * Math.PI * 2);
+                _padScale.set(size, size, size);
+                _padMatrix.compose(_padPos, _padQuat, _padScale);
+                const list = rng() < params.lilyPadSlitFraction ? slitMatrices : fullMatrices;
+                list.push(_padMatrix.clone());
+                break;
+            }
         }
     }
 
