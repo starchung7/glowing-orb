@@ -112,9 +112,10 @@ const _heights = new Float32Array(HMAP_RES * HMAP_RES);
     }
 }
 
-// Bilinearly sample the baked heightmap. Clamps to the terrain edge outside its
-// bounds so distant (foggy) regions stay flat rather than reading garbage.
-function terrainHeightAt(x, z) {
+// Bilinearly sample any HMAP_RES² field at a world XZ. Clamps to the field
+// edge outside its bounds so distant (foggy) regions read the border value
+// rather than garbage. Shared by the height and shore-distance lookups.
+function sampleTerrainField(field, x, z) {
     const fx = ((x - TERRAIN_MIN_X) / TERRAIN_SIZE_X) * (HMAP_RES - 1);
     const fz = ((z - TERRAIN_MIN_Z) / TERRAIN_SIZE_Z) * (HMAP_RES - 1);
     const cx = Math.min(HMAP_RES - 1, Math.max(0, fx));
@@ -122,11 +123,15 @@ function terrainHeightAt(x, z) {
     const x0 = Math.floor(cx), z0 = Math.floor(cz);
     const x1 = Math.min(HMAP_RES - 1, x0 + 1), z1 = Math.min(HMAP_RES - 1, z0 + 1);
     const tx = cx - x0, tz = cz - z0;
-    const h00 = _heights[z0 * HMAP_RES + x0], h10 = _heights[z0 * HMAP_RES + x1];
-    const h01 = _heights[z1 * HMAP_RES + x0], h11 = _heights[z1 * HMAP_RES + x1];
+    const h00 = field[z0 * HMAP_RES + x0], h10 = field[z0 * HMAP_RES + x1];
+    const h01 = field[z1 * HMAP_RES + x0], h11 = field[z1 * HMAP_RES + x1];
     const a = h00 + (h10 - h00) * tx;
     const b = h01 + (h11 - h01) * tx;
     return a + (b - a) * tz;
+}
+
+function terrainHeightAt(x, z) {
+    return sampleTerrainField(_heights, x, z);
 }
 
 // Height texture for the grass vertex shader. Stored as 8-bit normalized R
@@ -2144,20 +2149,9 @@ function makeRng(seed) {
 
 // Shore distance in world units at an XZ (bilinear over the baked field).
 // 0 on dry land AND exactly at the waterline; grows into the water.
+const SHORE_CELL_WORLD = 0.5 * (TERRAIN_SIZE_X + TERRAIN_SIZE_Z) / (HMAP_RES - 1);
 function shoreDistanceAt(x, z) {
-    const fx = ((x - TERRAIN_MIN_X) / TERRAIN_SIZE_X) * (HMAP_RES - 1);
-    const fz = ((z - TERRAIN_MIN_Z) / TERRAIN_SIZE_Z) * (HMAP_RES - 1);
-    const cx = Math.min(HMAP_RES - 1, Math.max(0, fx));
-    const cz = Math.min(HMAP_RES - 1, Math.max(0, fz));
-    const x0 = Math.floor(cx), z0 = Math.floor(cz);
-    const x1 = Math.min(HMAP_RES - 1, x0 + 1), z1 = Math.min(HMAP_RES - 1, z0 + 1);
-    const tx = cx - x0, tz = cz - z0;
-    const d00 = _shoreDist[z0 * HMAP_RES + x0], d10 = _shoreDist[z0 * HMAP_RES + x1];
-    const d01 = _shoreDist[z1 * HMAP_RES + x0], d11 = _shoreDist[z1 * HMAP_RES + x1];
-    const a = d00 + (d10 - d00) * tx;
-    const b = d01 + (d11 - d01) * tx;
-    const cellWorld = 0.5 * (TERRAIN_SIZE_X + TERRAIN_SIZE_Z) / (HMAP_RES - 1);
-    return (a + (b - a) * tz) * cellWorld;
+    return sampleTerrainField(_shoreDist, x, z) * SHORE_CELL_WORLD;
 }
 
 // A unit-radius circular pad: a regular triangle fan whose roundness is set by
@@ -2280,6 +2274,15 @@ const _padScale = new THREE.Vector3();
 const _padUp = new THREE.Vector3(0, 1, 0);
 const _padMatrix = new THREE.Matrix4();
 
+// Ground transform shared by pads and flowers: position + random Y spin +
+// uniform scale, returned as a fresh matrix ready for an InstancedMesh slot.
+function composePadMatrix(x, y, z, scale, rng) {
+    _padPos.set(x, y, z);
+    _padQuat.setFromAxisAngle(_padUp, rng() * Math.PI * 2);
+    _padScale.setScalar(scale);
+    return _padMatrix.compose(_padPos, _padQuat, _padScale).clone();
+}
+
 function buildLilyPads() {
     for (let i = lilyPadGroup.children.length - 1; i >= 0; i--) {
         const child = lilyPadGroup.children[i];
@@ -2329,15 +2332,12 @@ function buildLilyPads() {
                 const x = c.x + Math.cos(a) * r;
                 const z = c.z + Math.sin(a) * r;
                 if (terrainHeightAt(x, z) >= params.waterElevation) continue;
-                const shoreDist = shoreDistanceAt(x, z);
-                if (shoreDist > params.lilyPadShoreDistance * 1.4 +
-                    params.lilyPadShoreMin) continue;
                 const size = params.lilyPadMinSize +
                     rng() * Math.max(0, params.lilyPadMaxSize - params.lilyPadMinSize);
                 // Keep the whole pad off the shore: its center must sit at
                 // least the GUI minimum plus its own radius from the
                 // waterline, so the pad's edge never reaches the shore band.
-                if (shoreDist < size + params.lilyPadShoreMin) continue;
+                if (shoreDistanceAt(x, z) < size + params.lilyPadShoreMin) continue;
                 // No overlap: keep at least the two pads' radii between
                 // centers (pad geometry is a unit-radius disc scaled by size).
                 let overlaps = false;
@@ -2348,51 +2348,40 @@ function buildLilyPads() {
                 }
                 if (overlaps) continue;
                 placed.push({ x, z, size });
-                _padPos.set(x, surfaceY, z);
-                _padQuat.setFromAxisAngle(_padUp, rng() * Math.PI * 2);
-                _padScale.set(size, size, size);
-                _padMatrix.compose(_padPos, _padQuat, _padScale);
                 const list = rng() < params.lilyPadSlitFraction ? slitMatrices : fullMatrices;
-                list.push(_padMatrix.clone());
-                // Some pads grow a flower at their center, sized to the pad.
+                list.push(composePadMatrix(x, surfaceY, z, size, rng));
+                // Some pads grow a flower at their center, sized to the pad
+                // and sunk slightly into it so the petals' overlapping bases
+                // are hidden beneath the leaf instead of visibly clipping.
                 if (rng() < params.lilyFlowerChance) {
                     const fs = size * params.lilyFlowerScale;
-                    // Sink the flower slightly into the pad so the petals'
-                    // overlapping bases are hidden beneath the leaf instead of
-                    // visibly clipping through each other at the center.
-                    _padPos.set(x, surfaceY + size * params.lilyPadCrinkle - fs * 0.05, z);
-                    _padQuat.setFromAxisAngle(_padUp, rng() * Math.PI * 2);
-                    _padScale.set(fs, fs, fs);
-                    _padMatrix.compose(_padPos, _padQuat, _padScale);
-                    flowerMatrices.push(_padMatrix.clone());
+                    const fy = surfaceY + size * params.lilyPadCrinkle - fs * 0.05;
+                    flowerMatrices.push(composePadMatrix(x, fy, z, fs, rng));
                 }
                 break;
             }
         }
     }
 
-    for (const [withSlit, matrices] of [[true, slitMatrices], [false, fullMatrices]]) {
-        if (matrices.length === 0) continue;
-        const segments = Math.max(3, Math.floor(params.lilyPadVertices));
-        const geo = makeLilyPadGeometry(
-            withSlit, segments, params.lilyPadCrinkle,
-            makeRng(withSlit ? 101 : 202),
-        );
-        const inst = new THREE.InstancedMesh(geo, lilyPadMaterial, matrices.length);
-        inst.receiveShadow = params.sceneShadowsEnabled;
+    // One InstancedMesh per geometry (slit pads, full pads, flowers) — three
+    // draw calls total. Shadows are deliberately off: flat discs on open
+    // water never show a useful shadow, and skipping the shadow-map sampling
+    // keeps the pads free.
+    const segments = Math.max(3, Math.floor(params.lilyPadVertices));
+    const petals = Math.max(3, Math.floor(params.lilyFlowerPetals));
+    const batches = [
+        [makeLilyPadGeometry(true, segments, params.lilyPadCrinkle, makeRng(101)),
+            lilyPadMaterial, slitMatrices],
+        [makeLilyPadGeometry(false, segments, params.lilyPadCrinkle, makeRng(202)),
+            lilyPadMaterial, fullMatrices],
+        [makeLilyFlowerGeometry(petals, makeRng(303)),
+            lilyFlowerMaterial, flowerMatrices],
+    ];
+    for (const [geo, material, matrices] of batches) {
+        if (matrices.length === 0) { geo.dispose(); continue; }
+        const inst = new THREE.InstancedMesh(geo, material, matrices.length);
         inst.frustumCulled = false;
         for (let i = 0; i < matrices.length; i++) inst.setMatrixAt(i, matrices[i]);
-        inst.instanceMatrix.needsUpdate = true;
-        lilyPadGroup.add(inst);
-    }
-
-    if (flowerMatrices.length > 0) {
-        const petals = Math.max(3, Math.floor(params.lilyFlowerPetals));
-        const geo = makeLilyFlowerGeometry(petals, makeRng(303));
-        const inst = new THREE.InstancedMesh(geo, lilyFlowerMaterial, flowerMatrices.length);
-        inst.receiveShadow = params.sceneShadowsEnabled;
-        inst.frustumCulled = false;
-        for (let i = 0; i < flowerMatrices.length; i++) inst.setMatrixAt(i, flowerMatrices[i]);
         inst.instanceMatrix.needsUpdate = true;
         lilyPadGroup.add(inst);
     }
