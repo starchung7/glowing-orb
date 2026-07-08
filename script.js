@@ -331,6 +331,7 @@ const params = {
     lilyPadShoreDistance: 0.9,    // max distance from the waterline (world units)
     lilyPadSlitFraction: 0.5,     // share of pads using the slit variant
     lilyPadVertices: 22,          // rim vertex count (roundness of the circle)
+    lilyPadCrinkle: 0.06,         // random rim-vertex lift (leafy crinkle amount)
     lilyPadSeed: 7,               // reseed to reshuffle the layout
     // World boundary: roam too far from spawn and a thick fog rolls in and
     // whisks you back. Radial (distance from spawn), not tied to the plane edges.
@@ -2152,16 +2153,49 @@ function shoreDistanceAt(x, z) {
     return (a + (b - a) * tz) * cellWorld;
 }
 
-// A unit-radius flat circular pad: a regular triangle fan whose roundness is
-// set by the vertex-count slider. The slit variant leaves a wedge of the fan
-// uncovered (the classic lily-pad notch); the plain variant is a full circle.
-function makeLilyPadGeometry(withSlit, segments) {
+// A unit-radius circular pad: a regular triangle fan whose roundness is set by
+// the vertex-count slider. The rim stays at exactly radius 1 so the silhouette
+// is a true circle from above, but the rim undulates vertically (scaled by the
+// crinkle slider) so the flat-shaded facets tilt and catch the light unevenly,
+// reading as a crinkled leaf. The undulation is a sum of a few random-phase,
+// random-amplitude waves of different widths around the rim — broad irregular
+// bumps rather than uniform per-vertex noise — with just a hint of fine jitter
+// on top. Integer wave frequencies keep the full circle seamless. The slit
+// variant leaves a wedge of the fan uncovered (the classic lily-pad notch).
+function makeLilyPadGeometry(withSlit, segments, crinkle, rng) {
     const slitHalf = withSlit ? 0.38 : 0; // half-angle of the missing wedge
     const start = slitHalf, end = Math.PI * 2 - slitHalf;
-    const positions = [0, 0, 0]; // center vertex
+    // Three harmonics with distinct random frequencies (2–7 waves around the
+    // rim), phases and strengths, so no two bumps are the same size.
+    const waves = [];
+    const freqs = [2, 3, 4, 5, 6, 7];
+    for (let w = 0; w < 3; w++) {
+        const pick = Math.floor(rng() * freqs.length);
+        waves.push({
+            freq: freqs.splice(pick, 1)[0],
+            phase: rng() * Math.PI * 2,
+            amp: 0.35 + rng() * 0.65,
+        });
+    }
+    const rimLift = (a) => {
+        let s = 0;
+        for (const w of waves) s += Math.sin(a * w.freq + w.phase) * w.amp;
+        // Normalise roughly into 0..1, then scale by the crinkle amount.
+        return (s / 4 + 0.5) * crinkle;
+    };
+    // Fan apex: dead center for the full disc, but shifted toward the slit
+    // opening on the slit variant so the notch converges near the rim instead
+    // of the middle (real lily-pad slits stop well short of the center).
+    const apexX = withSlit ? 0.3 : 0;
+    const positions = [apexX, 0, 0];
     for (let i = 0; i <= segments; i++) {
         const a = start + (end - start) * (i / segments);
-        positions.push(Math.cos(a), 0, Math.sin(a));
+        // Fine per-vertex jitter (skipped on the closing seam vertex, which
+        // coincides with the first and must match it exactly).
+        const seam = !withSlit && i === segments;
+        const jitter = seam ? 0 : (rng() - 0.5) * crinkle * 0.25;
+        const lift = seam ? positions[4] : rimLift(a) + jitter;
+        positions.push(Math.cos(a), lift, Math.sin(a));
     }
     const indices = [];
     for (let i = 1; i <= segments; i++) indices.push(0, i + 1, i);
@@ -2245,7 +2279,10 @@ function buildLilyPads() {
     for (const [withSlit, matrices] of [[true, slitMatrices], [false, fullMatrices]]) {
         if (matrices.length === 0) continue;
         const segments = Math.max(3, Math.floor(params.lilyPadVertices));
-        const geo = makeLilyPadGeometry(withSlit, segments);
+        const geo = makeLilyPadGeometry(
+            withSlit, segments, params.lilyPadCrinkle,
+            makeRng(withSlit ? 101 : 202),
+        );
         const inst = new THREE.InstancedMesh(geo, lilyPadMaterial, matrices.length);
         inst.receiveShadow = params.sceneShadowsEnabled;
         inst.frustumCulled = false;
@@ -2689,6 +2726,8 @@ lilyFolder.add(params, 'lilyPadShoreDistance', 0.1, 5, 0.05).name('shore distanc
 lilyFolder.add(params, 'lilyPadSlitFraction', 0, 1, 0.05).name('slit fraction')
     .onFinishChange(buildLilyPads);
 lilyFolder.add(params, 'lilyPadVertices', 3, 64, 1).name('vertices')
+    .onFinishChange(buildLilyPads);
+lilyFolder.add(params, 'lilyPadCrinkle', 0, 0.3, 0.005).name('crinkle')
     .onFinishChange(buildLilyPads);
 lilyFolder.add(params, 'lilyPadSeed', 0, 100, 1).name('seed')
     .onFinishChange(buildLilyPads);
