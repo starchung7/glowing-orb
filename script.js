@@ -329,6 +329,7 @@ const params = {
     lilyPadMinSize: 0.05,         // smallest pad radius (world units)
     lilyPadMaxSize: 0.125,        // largest pad radius (world units)
     lilyPadShoreDistance: 0.9,    // max distance from the waterline (world units)
+    lilyPadShoreMin: 0.35,        // min distance from the waterline (world units)
     lilyPadSlitFraction: 0.5,     // share of pads using the slit variant
     lilyPadVertices: 22,          // rim vertex count (roundness of the circle)
     lilyPadCrinkle: 0.06,         // random rim-vertex lift (leafy crinkle amount)
@@ -2240,7 +2241,8 @@ function buildLilyPads() {
         const z = TERRAIN_MIN_Z + rng() * TERRAIN_SIZE_Z;
         if (terrainHeightAt(x, z) >= params.waterElevation) continue; // dry land
         const d = shoreDistanceAt(x, z);
-        if (d < 0.05 || d > params.lilyPadShoreDistance) continue;
+        if (d < params.lilyPadShoreMin || d > params.lilyPadShoreDistance +
+            params.lilyPadShoreMin) continue;
         // Keep clusters apart so they read as separate patches, not one carpet.
         const minGap = params.lilyPadClusterRadius * 3;
         let crowded = false;
@@ -2268,9 +2270,15 @@ function buildLilyPads() {
                 const x = c.x + Math.cos(a) * r;
                 const z = c.z + Math.sin(a) * r;
                 if (terrainHeightAt(x, z) >= params.waterElevation) continue;
-                if (shoreDistanceAt(x, z) > params.lilyPadShoreDistance * 1.4) continue;
+                const shoreDist = shoreDistanceAt(x, z);
+                if (shoreDist > params.lilyPadShoreDistance * 1.4 +
+                    params.lilyPadShoreMin) continue;
                 const size = params.lilyPadMinSize +
                     rng() * Math.max(0, params.lilyPadMaxSize - params.lilyPadMinSize);
+                // Keep the whole pad off the shore: its center must sit at
+                // least the GUI minimum plus its own radius from the
+                // waterline, so the pad's edge never reaches the shore band.
+                if (shoreDist < size + params.lilyPadShoreMin) continue;
                 // No overlap: keep at least the two pads' radii between
                 // centers (pad geometry is a unit-radius disc scaled by size).
                 let overlaps = false;
@@ -2738,6 +2746,8 @@ lilyFolder.add(params, 'lilyPadMinSize', 0.02, 0.5, 0.005).name('min size')
 lilyFolder.add(params, 'lilyPadMaxSize', 0.02, 0.8, 0.005).name('max size')
     .onFinishChange(buildLilyPads);
 lilyFolder.add(params, 'lilyPadShoreDistance', 0.1, 5, 0.05).name('shore distance')
+    .onFinishChange(buildLilyPads);
+lilyFolder.add(params, 'lilyPadShoreMin', 0, 3, 0.01).name('min shore distance')
     .onFinishChange(buildLilyPads);
 lilyFolder.add(params, 'lilyPadSlitFraction', 0, 1, 0.05).name('slit fraction')
     .onFinishChange(buildLilyPads);
