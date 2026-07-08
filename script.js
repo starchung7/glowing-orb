@@ -332,7 +332,7 @@ const params = {
     lilyPadShoreMin: 0.35,        // min distance from the waterline (world units)
     lilyPadSlitFraction: 0.5,     // share of pads using the slit variant
     lilyPadVertices: 22,          // rim vertex count (roundness of the circle)
-    lilyPadCrinkle: 0.06,         // random rim-vertex lift (leafy crinkle amount)
+    lilyPadCrinkle: 0.025,        // random rim-vertex lift (leafy crinkle amount)
     lilyPadSeed: 7,               // reseed to reshuffle the layout
     // Simple flower on some pads: rounded-triangle petals fanned around the
     // pad's center, tilted gently upward.
@@ -2361,7 +2361,7 @@ function buildLilyPads() {
                     // Sink the flower slightly into the pad so the petals'
                     // overlapping bases are hidden beneath the leaf instead of
                     // visibly clipping through each other at the center.
-                    _padPos.set(x, surfaceY + size * params.lilyPadCrinkle - fs * 0.15, z);
+                    _padPos.set(x, surfaceY + size * params.lilyPadCrinkle - fs * 0.05, z);
                     _padQuat.setFromAxisAngle(_padUp, rng() * Math.PI * 2);
                     _padScale.set(fs, fs, fs);
                     _padMatrix.compose(_padPos, _padQuat, _padScale);
