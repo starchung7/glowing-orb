@@ -323,7 +323,7 @@ const params = {
     // a full disc and one with the classic wedge slit cut out of it.
     lilyPadEnabled: true,
     lilyPadColor: '#150632',      // dark purple
-    lilyPadClusterCount: 14,      // shoreline clusters to attempt
+    lilyPadClusterCount: 18,      // shoreline clusters to attempt
     lilyPadsPerCluster: 6,        // average pads per cluster (±40% jitter)
     lilyPadClusterRadius: 0.45,   // world-units spread of a cluster
     lilyPadMinSize: 0.05,         // smallest pad radius (world units)
