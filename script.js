@@ -336,8 +336,10 @@ const params = {
     lilyPadShoreDistance: 0.9,    // max distance from the waterline (world units)
     lilyPadShoreMin: 0.35,        // min distance from the waterline (world units)
     lilyPadSlitFraction: 0.5,     // share of pads using the slit variant
-    lilyPadVertices: 22,          // rim vertex count (roundness of the circle)
-    lilyPadCrinkle: 0.025,        // random rim-vertex lift (leafy crinkle amount)
+    lilyPadVertices: 10,          // rim vertex count (roundness of the circle)
+    lilyPadCrinkle: 0,            // random rim-vertex lift (leafy crinkle amount)
+    lilyPadEdgeColor: '#523d76',  // brighter rim tint on each pad
+    lilyPadEdgeWidth: 0.08,       // fraction of the radius the rim tint covers
     lilyPadSeed: 7,               // reseed to reshuffle the layout
     // Simple flower on some pads: rounded-triangle petals fanned around the
     // pad's center, tilted gently upward.
@@ -2268,6 +2270,32 @@ const lilyPadMaterial = new THREE.MeshLambertMaterial({
     side: THREE.DoubleSide, // flat discs stay visible from below the surface too
 });
 
+// Brighter rim: the pad geometry is a unit-radius disc, so the local XZ
+// distance from the origin is 0 at the center and 1 at the rim. A varying
+// carries it to the fragment shader, which blends the base color toward the
+// edge color over the outer uPadEdgeWidth fraction of the radius.
+const lilyPadEdgeUniforms = {
+    uPadEdgeColor: { value: new THREE.Color(params.lilyPadEdgeColor) },
+    uPadEdgeWidth: { value: params.lilyPadEdgeWidth },
+};
+lilyPadMaterial.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, lilyPadEdgeUniforms);
+    shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', `#include <common>
+            varying float vPadRadius;`)
+        .replace('#include <begin_vertex>', `#include <begin_vertex>
+            vPadRadius = length(position.xz);`);
+    shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `#include <common>
+            uniform vec3 uPadEdgeColor;
+            uniform float uPadEdgeWidth;
+            varying float vPadRadius;`)
+        .replace('#include <color_fragment>', `#include <color_fragment>
+            float padEdge = smoothstep(
+                1.0 - uPadEdgeWidth, 1.0, vPadRadius);
+            diffuseColor.rgb = mix(diffuseColor.rgb, uPadEdgeColor, padEdge);`);
+};
+
 const _padPos = new THREE.Vector3();
 const _padQuat = new THREE.Quaternion();
 const _padScale = new THREE.Vector3();
@@ -2826,6 +2854,10 @@ lilyFolder.add(params, 'lilyPadVertices', 3, 64, 1).name('vertices')
     .onFinishChange(buildLilyPads);
 lilyFolder.add(params, 'lilyPadCrinkle', 0, 0.3, 0.005).name('crinkle')
     .onFinishChange(buildLilyPads);
+lilyFolder.addColor(params, 'lilyPadEdgeColor').name('edge color')
+    .onChange((v) => { lilyPadEdgeUniforms.uPadEdgeColor.value.set(v); });
+lilyFolder.add(params, 'lilyPadEdgeWidth', 0, 1, 0.01).name('edge width')
+    .onChange((v) => { lilyPadEdgeUniforms.uPadEdgeWidth.value = v; });
 lilyFolder.add(params, 'lilyPadSeed', 0, 100, 1).name('seed')
     .onFinishChange(buildLilyPads);
 lilyFolder.addColor(params, 'lilyFlowerColor').name('flower color')
