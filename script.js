@@ -323,6 +323,14 @@ const params = {
     treeHeight: 1.25,         // target world height the model is normalised to
     treeAreaRadius: 21,       // trees scatter within this radius of spawn
     treeClearing: 4,          // keep a clear circle around spawn (no trees)
+    treeEdgeMargin: 0.8,      // min world-space distance from a grass-patch edge
+    // Bridge placement — nudge on the ground plane via the GUI, then hardcode
+    // the values here once it's locked in.
+    bridgeX: 4,
+    bridgeY: 7.8,             // "y" in the GUI = the other ground axis (world Z)
+    bridgeScale: 0.35,
+    bridgeRotation: 181,      // yaw in degrees
+    bridgeHeight: 0.75,       // vertical offset from the terrain surface
     // Procedural low-poly lily pads, instanced in clusters hugging the
     // shoreline (placed via the baked shore-distance field). Two variants:
     // a full disc and one with the classic wedge slit cut out of it.
@@ -2045,6 +2053,58 @@ scene.add(ocean);
 const treeGroup = new THREE.Group();
 scene.add(treeGroup);
 
+// CPU-side copy of the feature map's pixels so tree placement can test the
+// same "green dominates" grass rule the grass shader uses. Loaded async via a
+// canvas readback; trees rebuild once it arrives so they respect the mask.
+let featurePixels = null; // { data: Uint8ClampedArray, width, height }
+{
+    const img = new Image();
+    img.onload = () => {
+        const cv = document.createElement('canvas');
+        cv.width = img.width;
+        cv.height = img.height;
+        const ctx = cv.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0);
+        featurePixels = {
+            data: ctx.getImageData(0, 0, img.width, img.height).data,
+            width: img.width,
+            height: img.height,
+        };
+        buildTrees();
+    };
+    img.src = featureMapUrl;
+}
+
+// True where the feature map marks grass (green channel dominant) at a world
+// XZ. Uses the same XZ→UV mapping as the grass shader (featureMap.flipY=false,
+// so v maps straight onto image rows top-down). Before the pixels load, or
+// outside the terrain footprint, reports non-grass.
+function isGrassAt(x, z) {
+    if (!featurePixels) return false;
+    const u = (x - TERRAIN_MIN_X) / TERRAIN_SIZE_X;
+    const v = (z - TERRAIN_MIN_Z) / TERRAIN_SIZE_Z;
+    if (u < 0 || u > 1 || v < 0 || v > 1) return false;
+    const { data, width, height } = featurePixels;
+    const px = Math.min(width - 1, Math.round(u * (width - 1)));
+    const py = Math.min(height - 1, Math.round(v * (height - 1)));
+    const i = (py * width + px) * 4;
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    return g - Math.max(r, b) > 8; // same test as the shader's grassGreen()
+}
+
+// Like isGrassAt, but also requires grass on a ring of samples `margin` world
+// units around the point, so positions hugging a grass-patch edge are
+// rejected and trees stay clear of the boundary.
+function isGrassWithMargin(x, z, margin) {
+    if (!isGrassAt(x, z)) return false;
+    if (margin <= 0) return true;
+    for (let k = 0; k < 8; k++) {
+        const a = (k / 8) * Math.PI * 2;
+        if (!isGrassAt(x + Math.cos(a) * margin, z + Math.sin(a) * margin)) return false;
+    }
+    return true;
+}
+
 // Captured once the GLB loads: each source mesh + its baked transform within the
 // model, the model's base (normalised) scale, and the lift that grounds it.
 let treeSources = null;
@@ -2077,12 +2137,19 @@ function buildTrees() {
     for (let i = 0; i < count; i++) {
         // Uniform-ish disk sampling in an annulus between the clearing and the
         // outer radius, so spawn stays open and no tree lands on the orb.
+        // Rejection-sample against the feature map so trees only land on the
+        // painted grass areas (paths, water, and bare ground are skipped).
         const rMin = params.treeClearing;
         const rMax = params.treeAreaRadius;
-        const r = Math.sqrt(rMin * rMin + Math.random() * (rMax * rMax - rMin * rMin));
-        const a = Math.random() * Math.PI * 2;
-        const x = Math.cos(a) * r;
-        const z = Math.sin(a) * r;
+        let x = 0, z = 0, found = false;
+        for (let attempt = 0; attempt < 40 && !found; attempt++) {
+            const r = Math.sqrt(rMin * rMin + Math.random() * (rMax * rMax - rMin * rMin));
+            const a = Math.random() * Math.PI * 2;
+            x = Math.cos(a) * r;
+            z = Math.sin(a) * r;
+            found = isGrassWithMargin(x, z, params.treeEdgeMargin);
+        }
+        if (!found) continue; // no grass found for this tree; drop it
         const variation = 0.8 + Math.random() * 0.5; // 0.8x – 1.3x size spread
         const s = treeBaseScale * variation;
 
@@ -2096,11 +2163,11 @@ function buildTrees() {
     // One InstancedMesh per source sub-mesh; bake the sub-mesh's transform inside
     // the model so multi-part trees (trunk + leaves) reconstruct correctly.
     for (const { geometry, material, matrix } of treeSources) {
-        const inst = new THREE.InstancedMesh(geometry, material, count);
+        const inst = new THREE.InstancedMesh(geometry, material, instances.length);
         inst.castShadow = params.sceneShadowsEnabled;
         inst.receiveShadow = params.sceneShadowsEnabled;
         inst.frustumCulled = false; // instances span the whole area; skip culling
-        for (let i = 0; i < count; i++) {
+        for (let i = 0; i < instances.length; i++) {
             _treeFinal.multiplyMatrices(instances[i], matrix);
             inst.setMatrixAt(i, _treeFinal);
         }
@@ -2134,6 +2201,42 @@ new GLTFLoader().load(treeUrl, (gltf) => {
 
     buildTrees();
 });
+
+// ----------------------------------------------------------------------------
+// Bridge — bridge1.glb, positioned by the GUI's x/y sliders (ground plane;
+// height conforms to the terrain under it). Loaded via a runtime URL so a
+// missing file just logs a warning instead of breaking the bundle.
+// ----------------------------------------------------------------------------
+let bridgeModel = null;
+
+function updateBridgePosition() {
+    if (!bridgeModel) return;
+    const x = params.bridgeX;
+    const z = params.bridgeY; // GUI "y" = ground-plane axis, i.e. world Z
+    bridgeModel.position.set(x, terrainHeightAt(x, z) + params.bridgeHeight, z);
+    bridgeModel.scale.setScalar(params.bridgeScale);
+    bridgeModel.rotation.y = THREE.MathUtils.degToRad(params.bridgeRotation);
+}
+
+{
+    const bridgeUrl = new URL('./assets/models/bridge1.glb', import.meta.url).href;
+    new GLTFLoader().load(
+        bridgeUrl,
+        (gltf) => {
+            bridgeModel = gltf.scene;
+            bridgeModel.traverse((o) => {
+                if (o.isMesh) {
+                    o.castShadow = params.sceneShadowsEnabled;
+                    o.receiveShadow = params.sceneShadowsEnabled;
+                }
+            });
+            updateBridgePosition();
+            scene.add(bridgeModel);
+        },
+        undefined,
+        () => console.warn('bridge1.glb not found at assets/models/bridge1.glb — bridge skipped'),
+    );
+}
 
 // ----------------------------------------------------------------------------
 // Lily pads — procedural low-poly discs floating on the water, clustered
@@ -2582,6 +2685,9 @@ function applySceneShadows(v) {
     for (const inst of treeGroup.children) {
         inst.castShadow = v; inst.receiveShadow = v;
     }
+    if (bridgeModel) bridgeModel.traverse((o) => {
+        if (o.isMesh) { o.castShadow = v; o.receiveShadow = v; }
+    });
     updateOrbShadowCaster();
 }
 
@@ -2835,6 +2941,20 @@ treeFolder.add(params, 'treeAreaRadius', 5, 40, 1).name('area radius')
     .onFinishChange(buildTrees);
 treeFolder.add(params, 'treeClearing', 0, 20, 0.5).name('clearing')
     .onFinishChange(buildTrees);
+treeFolder.add(params, 'treeEdgeMargin', 0, 3, 0.1).name('edge margin')
+    .onFinishChange(buildTrees);
+
+const bridgeFolder = gui.addFolder('Bridge');
+bridgeFolder.add(params, 'bridgeX', -25, 25, 0.1).name('x')
+    .onChange(updateBridgePosition);
+bridgeFolder.add(params, 'bridgeY', -25, 25, 0.1).name('y')
+    .onChange(updateBridgePosition);
+bridgeFolder.add(params, 'bridgeScale', 0.05, 5, 0.05).name('scale')
+    .onChange(updateBridgePosition);
+bridgeFolder.add(params, 'bridgeRotation', 0, 360, 1).name('rotation')
+    .onChange(updateBridgePosition);
+bridgeFolder.add(params, 'bridgeHeight', -3, 3, 0.01).name('height')
+    .onChange(updateBridgePosition);
 
 const lilyFolder = gui.addFolder('Lily Pads');
 lilyFolder.add(params, 'lilyPadEnabled').name('enabled').onChange(buildLilyPads);
