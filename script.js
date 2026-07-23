@@ -343,7 +343,7 @@ const params = {
     lilyPadSeed: 7,               // reseed to reshuffle the layout
     // Simple flower on some pads: rounded-triangle petals fanned around the
     // pad's center, tilted gently upward.
-    lilyFlowerColor: '#cf6ea8',   // petal pink
+    lilyFlowerColor: '#cf6e6e',   // petal rose
     lilyFlowerChance: 0.3,        // fraction of pads that grow a flower
     lilyFlowerScale: 0.45,        // flower radius as a fraction of its pad's radius
     lilyFlowerPetals: 6,          // petals fanned around the center
