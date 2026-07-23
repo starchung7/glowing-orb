@@ -833,12 +833,39 @@ orb.add(orbLight);
 // Hover + bobbing — the orb floats a fixed gap above the terrain surface and
 // drifts with sine noise. Spawn at the origin, lifted to the local ground.
 const HOVER_HEIGHT = 0.3;
+// Bridge physics state, declared before orbSurfaceHeightAt so the hover
+// lookup can consult it. Populated once bridge1.glb loads (see the bridge
+// section below); until then the surface queries just skip it.
+let bridgeBody = null;       // fixed Rapier body carrying the bridge collider
+let bridgeColliders = [];    // live colliders, replaced on every GUI move
+const _bridgeRay = new RAPIER.Ray({ x: 0, y: 0, z: 0 }, { x: 0, y: -1, z: 0 });
+
+// Top surface of the bridge at a world XZ via a downward ray against the
+// bridge colliders only, or -Infinity where there's no bridge overhead.
+function bridgeSurfaceHeightAt(x, z) {
+    if (bridgeColliders.length === 0) return -Infinity;
+    const startY = TERRAIN_HEIGHT_MAX + 10;
+    _bridgeRay.origin.x = x;
+    _bridgeRay.origin.y = startY;
+    _bridgeRay.origin.z = z;
+    const hit = world.castRay(
+        _bridgeRay, 100, true,
+        undefined, undefined, undefined, undefined,
+        (collider) => bridgeColliders.includes(collider),
+    );
+    return hit ? startY - hit.timeOfImpact : -Infinity;
+}
+
 // Orb-only collision surface: the orb treats the water plane as solid ground,
 // so over water basins it hovers on the surface instead of sinking to the
-// submerged terrain. Everything else (grass, trees, physics boxes) still uses
-// the raw terrain height.
-const orbSurfaceHeightAt = (x, z) =>
-    Math.max(terrainHeightAt(x, z), params.waterElevation);
+// submerged terrain, and rides up over the bridge deck where one is present.
+// Everything else (grass, trees, physics boxes) still uses the raw terrain
+// height (boxes collide with the bridge through its trimesh collider instead).
+const orbSurfaceHeightAt = (x, z) => Math.max(
+    terrainHeightAt(x, z),
+    params.waterElevation,
+    bridgeSurfaceHeightAt(x, z),
+);
 const targetPos = new THREE.Vector3(0, orbSurfaceHeightAt(0, 0) + HOVER_HEIGHT, 0);
 orb.position.copy(targetPos);
 const SPAWN = targetPos.clone(); // original spawn point for the boundary respawn
@@ -2209,6 +2236,45 @@ new GLTFLoader().load(treeUrl, (gltf) => {
 // ----------------------------------------------------------------------------
 let bridgeModel = null;
 
+// Static trimesh collider matching the bridge's rendered triangles exactly, so
+// the dynamic boxes rest on (and collide with) the deck and railings, and the
+// orb's hover raycast sees the real surface. Vertices are baked in world space,
+// so the collider is rebuilt whenever the GUI moves/scales/rotates the model.
+function rebuildBridgeCollider() {
+    if (!bridgeModel) return;
+    bridgeModel.updateMatrixWorld(true);
+
+    const verts = [];
+    const inds = [];
+    let base = 0;
+    const v = new THREE.Vector3();
+    bridgeModel.traverse((o) => {
+        if (!o.isMesh) return;
+        const pos = o.geometry.attributes.position;
+        for (let i = 0; i < pos.count; i++) {
+            v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+            verts.push(v.x, v.y, v.z);
+        }
+        const idx = o.geometry.index;
+        if (idx) {
+            for (let i = 0; i < idx.count; i++) inds.push(base + idx.getX(i));
+        } else {
+            for (let i = 0; i < pos.count; i++) inds.push(base + i);
+        }
+        base += pos.count;
+    });
+    if (verts.length === 0) return;
+
+    for (const c of bridgeColliders) world.removeCollider(c, false);
+    bridgeColliders = [];
+    if (!bridgeBody) bridgeBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+    bridgeColliders.push(world.createCollider(
+        RAPIER.ColliderDesc.trimesh(Float32Array.from(verts), Uint32Array.from(inds))
+            .setFriction(0.8),
+        bridgeBody,
+    ));
+}
+
 function updateBridgePosition() {
     if (!bridgeModel) return;
     const x = params.bridgeX;
@@ -2216,6 +2282,7 @@ function updateBridgePosition() {
     bridgeModel.position.set(x, terrainHeightAt(x, z) + params.bridgeHeight, z);
     bridgeModel.scale.setScalar(params.bridgeScale);
     bridgeModel.rotation.y = THREE.MathUtils.degToRad(params.bridgeRotation);
+    rebuildBridgeCollider();
 }
 
 {
