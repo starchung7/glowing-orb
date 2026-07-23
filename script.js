@@ -302,7 +302,7 @@ const params = {
     terrainNoiseEnabled: true,
     terrainNoiseScale: 1.8,     // world-space frequency of the terrain noise
     terrainNoiseContrast: 1.5,  // hardness of the light/dark mottling (1 = linear)
-    terrainNoiseStrength: 0.25, // brightness variation amount around the base tint
+    terrainNoiseStrength: 0.1, // brightness variation amount around the base tint
     grassColorBase: '#342b4a',// shaded blade base
     grassColorTip: '#615c7a', // lit blade tip
     grassFeatureMaskEnabled: true, // restrict grass to the feature map's green areas
